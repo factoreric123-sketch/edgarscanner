@@ -28,13 +28,13 @@ from collections import defaultdict
 # In GitHub Actions: set these as repo secrets
 # Locally / PythonAnywhere: can still hardcode below or use .env
 import os as _os
-SEC_API_KEY   = _os.getenv("SEC_API_KEY",   "9743857ae5bd7ecd6d06b86c2ac0d830f7b3cc95e3c409009d45869a9bf365f2")
-POLYGON_KEY   = _os.getenv("POLYGON_KEY",   "X3x5Hp9ut5yzxCtlXVyNly0eeXh1Xp_Q")
+SEC_API_KEY   = _os.getenv("SEC_API_KEY")
+POLYGON_KEY   = _os.getenv("POLYGON_KEY")
 POLYGON_BASE  = "https://api.polygon.io"
-ALPACA_KEY    = _os.getenv("ALPACA_KEY",    "PKNEK54A4X4UJQO6PM5KGD4Y5M")
-ALPACA_SECRET = _os.getenv("ALPACA_SECRET", "J3d3LCN792JL5iGXN4athsQS4GE8sHomt6NcPgvk2Cxc")
+ALPACA_KEY    = _os.getenv("ALPACA_KEY")
+ALPACA_SECRET = _os.getenv("ALPACA_SECRET")
 ALPACA_BASE   = "https://paper-api.alpaca.markets"
-DISCORD_URL   = _os.getenv("DISCORD_URL",   "https://discord.com/api/webhooks/1487093746125377636/5UM7umhLfgueBxuve7B0IRsXDwr5PW2N7pMZWTQAkCnnq944UZeq8BM7whRia5Fms2uj")
+DISCORD_URL   = _os.getenv("DISCORD_URL")
 
 # ── V15 CONFIG ────────────────────────────────────────────────────────────────
 
