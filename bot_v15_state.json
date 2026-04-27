@@ -1,0 +1,43 @@
+{
+  "positions": {
+    "SVRE": {
+      "ticker": "SVRE",
+      "entry_price": 3.36,
+      "shares": 8568,
+      "score": 65,
+      "kelly": 0.29,
+      "filed_date": "2026-04-15",
+      "entry_date": "2026-04-16",
+      "trail_stop": null,
+      "cluster": false,
+      "cluster_size": 1
+    },
+    "NKE": {
+      "ticker": "NKE",
+      "entry_price": 44.20,
+      "shares": 692,
+      "score": 74,
+      "kelly": 0.29,
+      "filed_date": "2026-04-15",
+      "entry_date": "2026-04-16",
+      "trail_stop": null,
+      "cluster": false,
+      "cluster_size": 1
+    },
+    "CAG": {
+      "ticker": "CAG",
+      "entry_price": 14.09,
+      "shares": 1057,
+      "score": 54,
+      "kelly": 0.29,
+      "filed_date": "2026-04-15",
+      "entry_date": "2026-04-16",
+      "trail_stop": null,
+      "cluster": false,
+      "cluster_size": 1
+    }
+  },
+  "seen_accessions": [],
+  "pending_trades": {},
+  "routine_history": {}
+}

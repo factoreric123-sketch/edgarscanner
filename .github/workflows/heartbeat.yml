@@ -20,7 +20,7 @@ jobs:
       - name: Restore state
         uses: actions/cache@v4
         with:
-          path: bot_state.json
+          path: bot_v15_state.json
           key: insideredge-state-v1
           restore-keys: insideredge-state-v1
       - name: Send heartbeat
