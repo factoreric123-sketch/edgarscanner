@@ -438,29 +438,47 @@ def get_financial_health(ticker): return True, "fmp_removed"
 
 # ── SEC API ───────────────────────────────────────────────────────────────────
 
-def fetch_form4_filings(hours_back=20):
-    """Uses /insider-trading endpoint — returns full parsed transaction data."""
-    since = (datetime.utcnow() - timedelta(hours=hours_back)).strftime("%Y-%m-%dT%H:%M:%S")
-    payload = {
-        "query": f'filedAt:["{since}" TO *]',
-        "from":  "0",
-        "size":  "50",
-        "sort":  [{"filedAt": {"order": "desc"}}],
-    }
-    try:
-        r = requests.post("https://api.sec-api.io/insider-trading",
-                          headers={"Authorization": SEC_API_KEY},
-                          json=payload, timeout=30)
-        log(f"SEC API → {r.status_code}")
-        if r.status_code != 200:
-            log(f"SEC API body: {r.text[:300]}")
-            return []
-        filings = r.json().get("transactions", [])
-        log(f"  insider-trading: {len(filings)} filings")
-        return filings
-    except Exception as e:
-        log(f"SEC API error: {e}")
-        return []
+def fetch_form4_filings(state, hours_back=20):
+    """Fetch only filings since last scan — prevents missing filings due to size cap."""
+    last = state.get("last_scan_time")
+    if last:
+        since = last
+    else:
+        since = (datetime.utcnow() - timedelta(hours=hours_back)).strftime("%Y-%m-%dT%H:%M:%S")
+
+    all_filings = []
+    page_size   = 50
+    from_idx    = 0
+    while True:
+        payload = {
+            "query": f'filedAt:["{since}" TO *]',
+            "from":  str(from_idx),
+            "size":  str(page_size),
+            "sort":  [{"filedAt": {"order": "asc"}}],
+        }
+        try:
+            r = requests.post("https://api.sec-api.io/insider-trading",
+                              headers={"Authorization": SEC_API_KEY},
+                              json=payload, timeout=30)
+            log(f"SEC API → {r.status_code} (from={from_idx})")
+            if r.status_code != 200:
+                log(f"SEC API body: {r.text[:300]}")
+                break
+            data     = r.json()
+            batch    = data.get("transactions", [])
+            total    = data.get("total", {}).get("value", 0)
+            all_filings.extend(batch)
+            from_idx += len(batch)
+            if from_idx >= total or not batch:
+                break
+        except Exception as e:
+            log(f"SEC API error: {e}")
+            break
+
+    # Update last scan time to now
+    state["last_scan_time"] = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S")
+    log(f"  insider-trading: {len(all_filings)} filings since {since}")
+    return all_filings
 
 def parse_filing_transactions(filing):
     """Parse /insider-trading endpoint response — different field names from search endpoint."""
@@ -777,7 +795,10 @@ def enter_position(state, ticker, score, score_comp, cluster, cluster_size,
 # Passing signals go into state["pending_trades"] — executed when market opens.
 
 def scan_filings(state):
-    filings = fetch_form4_filings(hours_back=20)
+    # Use 72h lookback on Mondays to catch all weekend filings
+    now_utc = datetime.utcnow()
+    hours_back = 72 if now_utc.weekday() == 0 else 20
+    filings = fetch_form4_filings(state, hours_back=hours_back)
     spy_r3m = get_spy_r3m()
     log(f"Filings: {len(filings)} | SPY r3m: {spy_r3m*100:+.1f}% {_regime_label(spy_r3m)}"
         if spy_r3m else f"Filings: {len(filings)}")
