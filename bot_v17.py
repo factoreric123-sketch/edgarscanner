@@ -897,12 +897,13 @@ def scan_filings(state):
 
         if atr_daily is None or h52 is None:
             log(f"  {ticker}: missing market data, skip")
-            discord_send(
-                f"⚙️ {ticker} | NO MARKET DATA",
-                f"**{ticker}** — filing found but Polygon returned no price/ATR data. Skipped.\n"
-                f"Insider: {name} ({title}) | Value: ${total_value:,.0f}",
-                0x95A5A6
-            )
+            if ticker != "NONE":
+                discord_send(
+                    f"⚙️ {ticker} | NO MARKET DATA",
+                    f"**{ticker}** — filing found but Polygon returned no price/ATR data. Skipped.\n"
+                    f"Insider: {name} ({title}) | Value: ${total_value:,.0f}",
+                    0x95A5A6
+                )
             continue
 
         pre5_return = get_pre5_return(ticker, filed_date)
