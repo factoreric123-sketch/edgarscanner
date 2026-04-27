@@ -192,6 +192,7 @@ def discord_signal(
         "ticker_blacklisted":     "🚫 **Blacklisted** — confirmed chronic loser across N≥5 trades",
         "see_remarks":            "❓ **SEE REMARKS** — unparseable filing, no actionable signal",
         "atr_too_low":            f"📉 **ATR too low** — {atr_d_s} < 1.0% (0 wins in 1,346-trade dataset)",
+        "52w_too_far":            f"💀 **Near zero** — 52w high Δ {h52_s} < -95% (distressed/delisted risk)",
         "private_placement":       "🏦 **Private placement** — value > 60× daily vol (not open market buy)",
         "10b5_plan":              "📋 **10b5-1 plan** — pre-scheduled, zero informational content",
         "cluster_too_large":      f"👥 **Cluster too large** — cs={cluster_size} > 5 (board grant pattern, WR=45.5%)",
@@ -641,9 +642,11 @@ def kelly_size(score, cluster, cluster_size):
 # ── V15 FILTERS ───────────────────────────────────────────────────────────────
 
 def apply_filters(ticker, title, is_10b5, cluster, cluster_size, score,
-                  r3m, spy_r3m, routine, atr_pct, avg_vol_30d=None, value=0):
+                  r3m, spy_r3m, routine, atr_pct, avg_vol_30d=None, value=0, h52=None):
     if ticker in TICKER_BLACKLIST:
         return "ticker_blacklisted"
+    if h52 is not None and h52 < -95:
+        return "52w_too_far"
     if "SEE REMARKS" in (title or "").upper():
         return "see_remarks"
     if atr_pct is not None and atr_pct < ATR_MIN_PCT:
@@ -909,7 +912,7 @@ def scan_filings(state):
 
         reason = apply_filters(ticker, title, is_10b5, cluster, cluster_size, score,
                                r3m, spy_r3m, routine, atr_daily,
-                               avg_vol_30d=avg_vol_30d, value=total_value)
+                               avg_vol_30d=avg_vol_30d, value=total_value, h52=h52)
 
         cl_str  = f"CLUSTER cs={cluster_size}" if cluster else "solo"
         r3m_str = f"{r3m*100:+.0f}%" if r3m is not None else "N/A"
