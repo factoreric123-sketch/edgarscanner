@@ -826,13 +826,6 @@ def scan_filings(state):
 
     for (ticker, filed_date), txns in by_ticker_date.items():
 
-        if ticker in state["positions"]:
-            log(f"  {ticker}: already in position, skip")
-            continue
-        if ticker in pending:
-            log(f"  {ticker}: already queued, skip")
-            continue
-
         cluster_size = len(set(t["name"] for t in txns))
         cluster      = cluster_size > 1
         total_value  = sum(t["value"] for t in txns)
@@ -848,17 +841,50 @@ def scan_filings(state):
         h52         = get_pct_from_52w_high(ticker)
         avg_vol_30d = get_avg_30d_volume_dollars(ticker)
         cur_px, chg = get_current_price_and_change(ticker)
+        sector       = get_sector(ticker)
+        health_ok, _ = get_financial_health(ticker)
+        score, score_comp = score_signal(total_value, atr_daily or 0, h52 or 0,
+                                         r3m, spy_r3m, cluster, cluster_size)
+
+        if ticker in state["positions"]:
+            log(f"  {ticker}: already in position, skip")
+            discord_signal(
+                ticker, filed_date, name, title,
+                cluster, cluster_size, total_value,
+                score, score_comp,
+                r3m, atr_daily, atr_monthly, h52, spy_r3m,
+                sector, health_ok, is_10b5, routine,
+                avg_vol_30d, cur_px, chg,
+                None, 0, traded=False, existing_position=True
+            )
+            continue
+        if ticker in pending:
+            log(f"  {ticker}: already queued, skip")
+            discord_signal(
+                ticker, filed_date, name, title,
+                cluster, cluster_size, total_value,
+                score, score_comp,
+                r3m, atr_daily, atr_monthly, h52, spy_r3m,
+                sector, health_ok, is_10b5, routine,
+                avg_vol_30d, cur_px, chg,
+                None, 0, traded=False, queued=True
+            )
+            continue
 
         if atr_daily is None or h52 is None:
             log(f"  {ticker}: missing market data, skip")
+            discord_send(
+                f"⚙️ {ticker} | NO MARKET DATA",
+                f"**{ticker}** — filing found but Polygon returned no price/ATR data. Skipped.\n"
+                f"Insider: {name} ({title}) | Value: ${total_value:,.0f}",
+                0x95A5A6
+            )
             continue
 
         pre5_return = get_pre5_return(ticker, filed_at)
 
         score, score_comp = score_signal(total_value, atr_daily, h52,
                                          r3m, spy_r3m, cluster, cluster_size, pre5_return)
-        sector       = get_sector(ticker)
-        health_ok, _ = get_financial_health(ticker)
 
         reason = apply_filters(ticker, title, is_10b5, cluster, cluster_size, score,
                                r3m, spy_r3m, routine, atr_daily,
