@@ -1,0 +1,33 @@
+name: Heartbeat
+
+on:
+  schedule:
+    - cron: '0 14 * * 1-5'   # 10:00 AM ET (market open check)
+    - cron: '0 18 * * 1-5'   # 2:00 PM ET
+    - cron: '0 22 * * 1-5'   # 6:00 PM ET (after close)
+  workflow_dispatch:
+
+jobs:
+  heartbeat:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install requests
+      - name: Restore state
+        uses: actions/cache@v4
+        with:
+          path: bot_state.json
+          key: insideredge-state-v1
+          restore-keys: insideredge-state-v1
+      - name: Send heartbeat
+        env:
+          SEC_API_KEY:   ${{ secrets.SEC_API_KEY }}
+          POLYGON_KEY:   ${{ secrets.POLYGON_KEY }}
+          ALPACA_KEY:    ${{ secrets.ALPACA_KEY }}
+          ALPACA_SECRET: ${{ secrets.ALPACA_SECRET }}
+          DISCORD_URL:   ${{ secrets.DISCORD_URL }}
+        run: python bot_v17.py --mode heartbeat
