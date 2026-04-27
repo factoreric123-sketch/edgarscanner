@@ -902,7 +902,7 @@ def scan_filings(state):
             )
             continue
 
-        pre5_return = get_pre5_return(ticker, filed_at)
+        pre5_return = get_pre5_return(ticker, filed_date)
 
         score, score_comp = score_signal(total_value, atr_daily, h52,
                                          r3m, spy_r3m, cluster, cluster_size, pre5_return)
