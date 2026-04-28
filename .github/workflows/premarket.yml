@@ -25,8 +25,8 @@ jobs:
         uses: actions/cache@v4
         with:
           path: bot_v15_state.json
-          key: insideredge-state-v1
-          restore-keys: insideredge-state-v1
+          key: insideredge-state-${{ github.run_id }}
+          restore-keys: insideredge-state-
       - name: Run pre-market scan
         env:
           SEC_API_KEY:   ${{ secrets.SEC_API_KEY }}
@@ -40,4 +40,4 @@ jobs:
         uses: actions/cache@v4
         with:
           path: bot_v15_state.json
-          key: insideredge-state-v1
+          key: insideredge-state-${{ github.run_id }}
