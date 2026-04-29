@@ -75,6 +75,14 @@ TICKER_BLACKLIST = {
     "LRMR","DMAC","NKTX",
 }
 
+INSTITUTIONAL_BUYER_KEYWORDS = (
+    "HRT FINANCIAL",
+    "CITADEL ADVISORS",
+    "RENAISSANCE TECHNOLOGIES",
+    "TWO SIGMA",
+    "VIRTU",
+)
+
 # ── HELPERS ───────────────────────────────────────────────────────────────────
 
 def sf(v, d=0.0):
@@ -83,6 +91,24 @@ def sf(v, d=0.0):
 
 def log(msg):
     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}", flush=True)
+
+def _score_floor(cluster, spy_r3m):
+    if not cluster:
+        return SOLO_MIN_SCORE
+    spy = spy_r3m if spy_r3m is not None else 0
+    if SPY_MILD_STRESS_LO <= spy < SPY_MILD_STRESS_HI:
+        return CLUSTER_STRESS_FLOOR
+    return CLUSTER_MIN_SCORE
+
+def _normalize_owner_name(name):
+    cleaned = (name or "").upper()
+    for ch in ",.;:-_/\\()[]{}":
+        cleaned = cleaned.replace(ch, " ")
+    return " ".join(cleaned.split())
+
+def is_institutional_buyer(name):
+    normalized = _normalize_owner_name(name)
+    return any(keyword in normalized for keyword in INSTITUTIONAL_BUYER_KEYWORDS)
 
 # ── STATE ─────────────────────────────────────────────────────────────────────
 
@@ -192,6 +218,8 @@ def discord_signal(
         "ticker_blacklisted":     "🚫 **Blacklisted** — confirmed chronic loser across N≥5 trades",
         "see_remarks":            "❓ **SEE REMARKS** — unparseable filing, no actionable signal",
         "atr_too_low":            f"📉 **ATR too low** — {atr_d_s} < 1.0% (0 wins in 1,346-trade dataset)",
+        "52w_too_far":            f"💀 **Near zero** — 52w high Δ {h52_s} <= -95% (distressed/delisted risk)",
+        "institutional_buyer":    f"🏦 **Institutional/HFT filer** — {insider_name or 'This filer'} is not treated as a conviction insider buy",
         "private_placement":       "🏦 **Private placement** — value > 60× daily vol (not open market buy)",
         "10b5_plan":              "📋 **10b5-1 plan** — pre-scheduled, zero informational content",
         "cluster_too_large":      f"👥 **Cluster too large** — cs={cluster_size} > 5 (board grant pattern, WR=45.5%)",
@@ -600,12 +628,14 @@ def score_signal(value, atr_pct, pct_from_52w_high, r3m, spy_r3m, cluster, clust
     elif spy <= 0.10:   comp["pts_spy"] = 0
     else:               comp["pts_spy"] = 10
 
-    comp["pts_pre5"] = 5 if pre5_return is not None and pre5_return >= 0 else 0
-
     for k in ["pts_title","pts_ownership","pts_staleness","pts_repeat","pts_whale","pts_market","pts_recency"]:
         comp[k] = 0
 
-    return min(sum(comp.values()), 100), comp
+    base_score = min(sum(comp.values()), 100)
+    score_floor = _score_floor(cluster, spy_r3m)
+    comp["pts_pre5"] = 5 if pre5_return is not None and pre5_return >= 0 and base_score >= score_floor else 0
+
+    return min(base_score + comp["pts_pre5"], 100), comp
 
 # ── V15 KELLY ─────────────────────────────────────────────────────────────────
 
@@ -623,9 +653,14 @@ def kelly_size(score, cluster, cluster_size):
 # ── V15 FILTERS ───────────────────────────────────────────────────────────────
 
 def apply_filters(ticker, title, is_10b5, cluster, cluster_size, score,
-                  r3m, spy_r3m, routine, atr_pct, avg_vol_30d=None, value=0):
+                  r3m, spy_r3m, routine, atr_pct, avg_vol_30d=None, value=0,
+                  h52=None, insider_name=None):
     if ticker in TICKER_BLACKLIST:
         return "ticker_blacklisted"
+    if h52 is not None and h52 <= -95:
+        return "52w_too_far"
+    if insider_name and is_institutional_buyer(insider_name):
+        return "institutional_buyer"
     if "SEE REMARKS" in (title or "").upper():
         return "see_remarks"
     if atr_pct is not None and atr_pct < ATR_MIN_PCT:
@@ -641,7 +676,7 @@ def apply_filters(ticker, title, is_10b5, cluster, cluster_size, score,
     # V15 dynamic regime
     _spy = spy_r3m if spy_r3m is not None else 0
     _in_mild_stress = (SPY_MILD_STRESS_LO <= _spy < SPY_MILD_STRESS_HI)
-    _cluster_floor  = CLUSTER_STRESS_FLOOR if _in_mild_stress else CLUSTER_MIN_SCORE
+    _cluster_floor = _score_floor(cluster, spy_r3m)
     if not cluster and score < SOLO_MIN_SCORE:
         return "score_too_low"
     if cluster and score < _cluster_floor:
@@ -862,7 +897,8 @@ def scan_filings(state):
 
         reason = apply_filters(ticker, title, is_10b5, cluster, cluster_size, score,
                                r3m, spy_r3m, routine, atr_daily,
-                               avg_vol_30d=avg_vol_30d, value=total_value)
+                               avg_vol_30d=avg_vol_30d, value=total_value,
+                               h52=h52, insider_name=name)
 
         cl_str  = f"CLUSTER cs={cluster_size}" if cluster else "solo"
         r3m_str = f"{r3m*100:+.0f}%" if r3m is not None else "N/A"
