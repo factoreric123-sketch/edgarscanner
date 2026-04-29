@@ -19,6 +19,7 @@ v15 fix:
 """
 
 import requests, json, os, time
+import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 from collections import defaultdict
 
@@ -28,13 +29,15 @@ from collections import defaultdict
 # In GitHub Actions: set these as repo secrets
 # Locally / PythonAnywhere: can still hardcode below or use .env
 import os as _os
-SEC_API_KEY   = _os.getenv("SEC_API_KEY")
 POLYGON_KEY   = _os.getenv("POLYGON_KEY")
 POLYGON_BASE  = "https://api.polygon.io"
 ALPACA_KEY    = _os.getenv("ALPACA_KEY")
 ALPACA_SECRET = _os.getenv("ALPACA_SECRET")
 ALPACA_BASE   = "https://paper-api.alpaca.markets"
 DISCORD_URL   = _os.getenv("DISCORD_URL")
+EDGAR_USER_AGENT = _os.getenv("EDGAR_USER_AGENT", "InsiderEdgeBot/1.0 factoreric123@gmail.com")
+EDGAR_CURRENT_COUNT = 100
+EDGAR_MAX_FEED_PAGES = 30
 
 # ── V15 CONFIG ────────────────────────────────────────────────────────────────
 
@@ -468,92 +471,347 @@ def get_financial_health(ticker): return True, "fmp_removed"
 
 # ── SEC API ───────────────────────────────────────────────────────────────────
 
-def fetch_form4_filings(state, hours_back=20):
-    """Fetch only filings since last scan — prevents missing filings due to size cap."""
+def _sec_headers():
+    return {
+        "User-Agent": EDGAR_USER_AGENT,
+        "Accept-Encoding": "gzip, deflate",
+    }
+
+
+def _sec_get(url, timeout=20, retries=4):
+    for attempt in range(retries):
+        try:
+            r = requests.get(url, headers=_sec_headers(), timeout=timeout)
+            if r.status_code == 429:
+                time.sleep(1 + attempt)
+                continue
+            return r
+        except Exception:
+            if attempt == retries - 1:
+                raise
+            time.sleep(1 + attempt)
+    raise RuntimeError("SEC request retries exhausted")
+
+
+def _safe_text(elem, path):
+    node = elem.find(path) if elem is not None else None
+    if node is None or node.text is None:
+        return ""
+    return node.text.strip()
+
+
+def _truthy_flag(value):
+    return str(value or "").strip().lower() in {"1", "true", "y", "yes"}
+
+
+def _relationship_title(rel):
+    title = (rel.get("officerTitle") or "").strip()
+    if title:
+        return title
+    if rel.get("isDirector") and rel.get("isOfficer"):
+        return "Director/Officer"
+    if rel.get("isDirector"):
+        return "Director"
+    if rel.get("isOfficer"):
+        return "Officer"
+    if rel.get("isTenPercentOwner"):
+        return "10% Owner"
+    if rel.get("isOther"):
+        return "Other"
+    return "N/A"
+
+
+def _parse_since_utc(state, hours_back):
     last = state.get("last_scan_time")
     if last:
-        since = last
-    else:
-        since = (datetime.utcnow() - timedelta(hours=hours_back)).strftime("%Y-%m-%dT%H:%M:%S")
-
-    all_filings = []
-    page_size   = 50
-    from_idx    = 0
-    while True:
-        payload = {
-            "query": f'filedAt:["{since}" TO *]',
-            "from":  str(from_idx),
-            "size":  str(page_size),
-            "sort":  [{"filedAt": {"order": "asc"}}],
-        }
         try:
-            r = requests.post("https://api.sec-api.io/insider-trading",
-                              headers={"Authorization": SEC_API_KEY},
-                              json=payload, timeout=30)
-            log(f"SEC API → {r.status_code} (from={from_idx})")
+            return datetime.strptime(last, "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
+        except Exception:
+            pass
+    return datetime.now(timezone.utc) - timedelta(hours=hours_back)
+
+
+def _parse_feed_datetime(value):
+    try:
+        parsed = datetime.fromisoformat((value or "").strip())
+        return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
+
+
+def _is_form4_term(term):
+    return str(term or "").upper().startswith("4")
+
+
+def _fetch_current_form4_entries(since_utc):
+    entries = []
+    seen_accessions = set()
+    atom_ns = {"atom": "http://www.w3.org/2005/Atom"}
+
+    for page in range(EDGAR_MAX_FEED_PAGES):
+        start = page * EDGAR_CURRENT_COUNT
+        url = (
+            "https://www.sec.gov/cgi-bin/browse-edgar"
+            f"?action=getcurrent&type=4&owner=only&count={EDGAR_CURRENT_COUNT}"
+            f"&start={start}&output=atom"
+        )
+        try:
+            r = _sec_get(url, timeout=25)
+            log(f"SEC feed -> {r.status_code} (start={start})")
             if r.status_code != 200:
-                log(f"SEC API body: {r.text[:300]}")
+                log(f"SEC feed body: {r.text[:300]}")
                 break
-            data     = r.json()
-            batch    = data.get("transactions", [])
-            total    = data.get("total", {}).get("value", 0)
-            all_filings.extend(batch)
-            from_idx += len(batch)
-            if from_idx >= total or not batch:
-                break
+            root = ET.fromstring(r.text)
         except Exception as e:
-            log(f"SEC API error: {e}")
+            log(f"SEC feed error: {e}")
             break
 
-    # Update last scan time to now
+        page_entries = root.findall("atom:entry", atom_ns)
+        if not page_entries:
+            break
+
+        oldest_page_dt = None
+        for entry in page_entries:
+            updated = _parse_feed_datetime(entry.findtext("atom:updated", "", atom_ns))
+            if updated is None:
+                continue
+            updated_utc = updated.astimezone(timezone.utc)
+            if oldest_page_dt is None or updated_utc < oldest_page_dt:
+                oldest_page_dt = updated_utc
+            if updated_utc < since_utc:
+                continue
+
+            category = entry.find("atom:category", atom_ns)
+            term = category.attrib.get("term", "") if category is not None else ""
+            if not _is_form4_term(term):
+                continue
+
+            entry_id = entry.findtext("atom:id", "", atom_ns)
+            accession = entry_id.rsplit("=", 1)[-1].strip()
+            if not accession or accession in seen_accessions:
+                continue
+
+            link = ""
+            for link_node in entry.findall("atom:link", atom_ns):
+                if link_node.attrib.get("rel") == "alternate":
+                    link = link_node.attrib.get("href", "").strip()
+                    break
+            if not link:
+                continue
+
+            seen_accessions.add(accession)
+            entries.append({
+                "accessionNo": accession,
+                "filedAt": updated.isoformat(),
+                "link": link,
+            })
+
+        if oldest_page_dt is not None and oldest_page_dt < since_utc:
+            break
+
+    return entries
+
+
+def _pick_ownership_xml_name(items):
+    xml_names = []
+    for item in items:
+        name = item.get("name", "")
+        lower = name.lower()
+        if lower.endswith(".xml") and not lower.endswith("index.xml"):
+            xml_names.append(name)
+    for preferred in ("ownership.xml", "form4.xml"):
+        for name in xml_names:
+            if name.lower() == preferred:
+                return name
+    for name in xml_names:
+        lower = name.lower()
+        if "ownership" in lower or "form4" in lower:
+            return name
+    return xml_names[0] if xml_names else ""
+
+
+def _normalize_form4_xml(accession, filed_at, xml_text):
+    try:
+        root = ET.fromstring(xml_text)
+    except Exception as e:
+        log(f"  {accession}: XML parse error: {e}")
+        return []
+
+    issuer = {
+        "cik": _safe_text(root, "issuer/issuerCik"),
+        "name": _safe_text(root, "issuer/issuerName"),
+        "tradingSymbol": _safe_text(root, "issuer/issuerTradingSymbol"),
+    }
+    if not issuer["tradingSymbol"]:
+        return []
+
+    footnote_map = {}
+    for footnote in root.findall(".//footnote"):
+        footnote_id = footnote.attrib.get("id", "").strip()
+        text = "".join(footnote.itertext()).strip()
+        if footnote_id and text:
+            footnote_map[footnote_id] = text
+    doc_footnotes = " ".join(footnote_map.values())
+    aff_10b5 = _truthy_flag(_safe_text(root, "aff10b5One"))
+
+    transactions = []
+    for txn in root.findall(".//nonDerivativeTable/nonDerivativeTransaction"):
+        code = _safe_text(txn, "transactionCoding/transactionCode").upper()
+        footnote_ids = [node.attrib.get("id", "").strip() for node in txn.findall(".//footnoteId")]
+        txn_footnotes = " ".join(footnote_map.get(fid, "") for fid in footnote_ids if fid)
+        transactions.append({
+            "coding": {
+                "code": code,
+                "planFlag": aff_10b5,
+            },
+            "transactionCoding": {
+                "transactionCode": code,
+            },
+            "amounts": {
+                "shares": _safe_text(txn, "transactionAmounts/transactionShares/value"),
+                "pricePerShare": _safe_text(txn, "transactionAmounts/transactionPricePerShare/value"),
+            },
+            "footnotes": txn_footnotes,
+        })
+
+    owners = root.findall("reportingOwner")
+    if not owners:
+        owners = [None]
+
+    filings = []
+    for owner in owners:
+        rel = {
+            "officerTitle": _safe_text(owner, "reportingOwnerRelationship/officerTitle"),
+            "isDirector": _truthy_flag(_safe_text(owner, "reportingOwnerRelationship/isDirector")),
+            "isOfficer": _truthy_flag(_safe_text(owner, "reportingOwnerRelationship/isOfficer")),
+            "isTenPercentOwner": _truthy_flag(_safe_text(owner, "reportingOwnerRelationship/isTenPercentOwner")),
+            "isOther": _truthy_flag(_safe_text(owner, "reportingOwnerRelationship/isOther")),
+        }
+
+        filings.append({
+            "accessionNo": accession,
+            "filedAt": filed_at,
+            "issuer": issuer,
+            "reportingOwner": {
+                "name": _safe_text(owner, "reportingOwnerId/rptOwnerName"),
+                "relationship": {
+                    **rel,
+                    "displayTitle": _relationship_title(rel),
+                },
+            },
+            "nonDerivativeTable": {
+                "transactions": transactions,
+            },
+            "footnotes": doc_footnotes,
+        })
+    return filings
+
+
+def _fetch_normalized_form4_filing(entry):
+    accession = entry.get("accessionNo", "")
+    filed_at = entry.get("filedAt", "")
+    folder_url = (entry.get("link", "") or "").rsplit("/", 1)[0]
+    if not accession or not folder_url:
+        return []
+
+    try:
+        r = _sec_get(f"{folder_url}/index.json")
+        if r.status_code != 200:
+            log(f"  {accession}: filing index -> {r.status_code}")
+            return []
+        items = ((r.json().get("directory") or {}).get("item")) or []
+        xml_name = _pick_ownership_xml_name(items)
+        if not xml_name:
+            log(f"  {accession}: ownership XML not found")
+            return []
+
+        xml_r = _sec_get(f"{folder_url}/{xml_name}")
+        if xml_r.status_code != 200:
+            log(f"  {accession}: ownership XML -> {xml_r.status_code}")
+            return []
+        return _normalize_form4_xml(accession, filed_at, xml_r.text)
+    except Exception as e:
+        log(f"  {accession}: filing fetch error: {e}")
+        return []
+
+
+def fetch_form4_filings(state, hours_back=20):
+    """Fetch recent Form 4 filings from the SEC's free current-filings feed."""
+    since_utc = _parse_since_utc(state, hours_back)
+    entries = _fetch_current_form4_entries(since_utc)
+
+    filings = []
+    seen_accessions = set()
+    already_seen = set(state.get("seen_accessions", []))
+    for entry in entries:
+        accession = entry.get("accessionNo", "")
+        if not accession or accession in seen_accessions:
+            continue
+        seen_accessions.add(accession)
+
+        if accession in already_seen:
+            filings.append({
+                "accessionNo": accession,
+                "filedAt": entry.get("filedAt", ""),
+            })
+            continue
+
+        filings.extend(_fetch_normalized_form4_filing(entry))
+
     state["last_scan_time"] = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S")
-    log(f"  insider-trading: {len(all_filings)} filings since {since}")
-    return all_filings
+    log(f"  EDGAR feed: {len(entries)} accessions since {since_utc.isoformat()}")
+    return filings
+
 
 def parse_filing_transactions(filing):
-    """Parse /insider-trading endpoint response — different field names from search endpoint."""
-    txns   = []
+    """Parse normalized SEC ownership XML into the bot's internal transaction shape."""
+    txns = []
     issuer = filing.get("issuer") or {}
     ticker = (issuer.get("tradingSymbol") or filing.get("ticker") or "").strip()
-    if not ticker: return []
+    if not ticker:
+        return []
     accession = filing.get("accessionNo", "")
-    filed_at  = (filing.get("filedAt", "") or "")[:10]
-    if not filed_at: return []
+    filed_at = (filing.get("filedAt", "") or "")[:10]
+    if not filed_at:
+        return []
     owner = filing.get("reportingOwner") or {}
-    rel   = owner.get("relationship") or {}
-    name  = (owner.get("name") or "").strip()
-    title = (rel.get("officerTitle") or "").strip()
-    if not title:
-        title = "Director" if rel.get("isDirector") else ("Officer" if rel.get("isOfficer") else "")
-    ndt      = filing.get("nonDerivativeTable") or {}
+    rel = owner.get("relationship") or {}
+    name = (owner.get("name") or "").strip()
+    title = (rel.get("displayTitle") or _relationship_title(rel)).strip()
+    ndt = filing.get("nonDerivativeTable") or {}
     txn_list = ndt.get("transactions", [])
     for txn in txn_list:
         code = (txn.get("coding", {}).get("code") or "").upper()
-        if code != "P": continue
+        if code != "P":
+            continue
         amounts = txn.get("amounts") or {}
         try:
             shares = abs(float(amounts.get("shares") or 0))
-            price  = float(amounts.get("pricePerShare") or 0)
-        except: continue
+            price = float(amounts.get("pricePerShare") or 0)
+        except Exception:
+            continue
         value = shares * price
-        if value < 50_000: continue
-        coding    = txn.get("coding") or {}
-        footnotes = str(txn.get("footnotes","")) + str(filing.get("footnotes",""))
-        is_10b5   = bool(coding.get("planFlag") or coding.get("plan") or
-                         "10b5" in footnotes.lower() or
-                         str(coding.get("code","")).lower() == "a")
+        if value < 50_000:
+            continue
+        coding = txn.get("coding") or {}
+        footnotes = str(txn.get("footnotes", "")) + str(filing.get("footnotes", ""))
+        is_10b5 = bool(
+            coding.get("planFlag")
+            or coding.get("plan")
+            or "10b5" in footnotes.lower()
+            or str(coding.get("code", "")).lower() == "a"
+        )
         txns.append({
-            "ticker":    ticker,
+            "ticker": ticker,
             "accession": accession,
-            "filed_at":  filed_at,
-            "name":      name,
-            "title":     title,
-            "is_10b5":   is_10b5,
-            "value":     value,
+            "filed_at": filed_at,
+            "name": name,
+            "title": title,
+            "is_10b5": is_10b5,
+            "value": value,
         })
     return txns
 
-# ── V15 SCORING ───────────────────────────────────────────────────────────────
 
 def get_days_to_earnings(ticker, as_of_date_str):
     """Returns days between filing date and nearest earnings date (negative = earnings already passed)."""
