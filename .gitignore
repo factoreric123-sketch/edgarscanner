@@ -1,2 +1,4 @@
 .claude/
 UsersefactDownloadsmybot/
+__pycache__/
+missed_signals_report*.json
