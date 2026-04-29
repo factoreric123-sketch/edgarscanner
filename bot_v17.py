@@ -51,6 +51,7 @@ HEALTH_FILTER_BYPASS_SCORE= 70
 MAX_CLUSTER_SIZE          = 5      # v16: cs=6 WR=45.5% (board grants) — cap at cs=5 WR=86.4%
 MAX_INSIDER_BUYS_90D      = 3
 ATR_MIN_PCT               = 1.0    # v14: ATR<1% = 0 wins in 1346 trades
+EARNINGS_PROXIMITY_DAYS   = 5      # skip if filing within ±5 days of earnings
 
 # V15 regime constants
 SPY_MILD_STRESS_LO        = -0.03  # SPY r3m -3% to 0% = mild stress
@@ -193,6 +194,7 @@ def discord_signal(
         "see_remarks":            "❓ **SEE REMARKS** — unparseable filing, no actionable signal",
         "atr_too_low":            f"📉 **ATR too low** — {atr_d_s} < 1.0% (0 wins in 1,346-trade dataset)",
         "52w_too_far":            f"💀 **Near zero** — 52w high Δ {h52_s} < -95% (distressed/delisted risk)",
+        "earnings_proximity":     f"📅 **Earnings too close** — filing within ±5 days of earnings (noise, not conviction)",
         "private_placement":       "🏦 **Private placement** — value > 60× daily vol (not open market buy)",
         "10b5_plan":              "📋 **10b5-1 plan** — pre-scheduled, zero informational content",
         "cluster_too_large":      f"👥 **Cluster too large** — cs={cluster_size} > 5 (board grant pattern, WR=45.5%)",
@@ -526,6 +528,31 @@ def parse_filing_transactions(filing):
 
 # ── V15 SCORING ───────────────────────────────────────────────────────────────
 
+def get_days_to_earnings(ticker, as_of_date_str):
+    """Returns days between filing date and nearest earnings date (negative = earnings already passed)."""
+    try:
+        as_of = datetime.strptime(as_of_date_str[:10], "%Y-%m-%d")
+        # Look 30 days back and 30 days forward
+        from_dt = (as_of - timedelta(days=30)).strftime("%Y-%m-%d")
+        to_dt   = (as_of + timedelta(days=30)).strftime("%Y-%m-%d")
+        url = (f"{POLYGON_BASE}/vX/reference/financials"
+               f"?ticker={ticker}&filing_date.gte={from_dt}&filing_date.lte={to_dt}"
+               f"&timeframe=quarterly&limit=5&apiKey={POLYGON_KEY}")
+        r = requests.get(url, timeout=10)
+        if r.status_code != 200:
+            return None
+        results = r.json().get("results", [])
+        if not results:
+            return None
+        # Find closest earnings to filing date
+        closest = min(results, key=lambda x: abs(
+            (datetime.strptime(x["filing_date"][:10], "%Y-%m-%d") - as_of).days
+        ))
+        earnings_dt = datetime.strptime(closest["filing_date"][:10], "%Y-%m-%d")
+        return (earnings_dt - as_of).days
+    except Exception:
+        return None
+
 def get_pre5_return(ticker, as_of_date_str):
     try:
         entry_dt = datetime.strptime(as_of_date_str[:10], "%Y-%m-%d")
@@ -642,11 +669,13 @@ def kelly_size(score, cluster, cluster_size):
 # ── V15 FILTERS ───────────────────────────────────────────────────────────────
 
 def apply_filters(ticker, title, is_10b5, cluster, cluster_size, score,
-                  r3m, spy_r3m, routine, atr_pct, avg_vol_30d=None, value=0, h52=None):
+                  r3m, spy_r3m, routine, atr_pct, avg_vol_30d=None, value=0, h52=None, days_to_earnings=None):
     if ticker in TICKER_BLACKLIST:
         return "ticker_blacklisted"
     if h52 is not None and h52 < -95:
         return "52w_too_far"
+    if days_to_earnings is not None and abs(days_to_earnings) <= EARNINGS_PROXIMITY_DAYS:
+        return "earnings_proximity"
     if "SEE REMARKS" in (title or "").upper():
         return "see_remarks"
     if atr_pct is not None and atr_pct < ATR_MIN_PCT:
@@ -906,14 +935,16 @@ def scan_filings(state):
                 )
             continue
 
-        pre5_return = get_pre5_return(ticker, filed_date)
+        pre5_return      = get_pre5_return(ticker, filed_date)
+        days_to_earnings = get_days_to_earnings(ticker, filed_date)
 
         score, score_comp = score_signal(total_value, atr_daily, h52,
                                          r3m, spy_r3m, cluster, cluster_size, pre5_return)
 
         reason = apply_filters(ticker, title, is_10b5, cluster, cluster_size, score,
                                r3m, spy_r3m, routine, atr_daily,
-                               avg_vol_30d=avg_vol_30d, value=total_value, h52=h52)
+                               avg_vol_30d=avg_vol_30d, value=total_value, h52=h52,
+                               days_to_earnings=days_to_earnings)
 
         cl_str  = f"CLUSTER cs={cluster_size}" if cluster else "solo"
         r3m_str = f"{r3m*100:+.0f}%" if r3m is not None else "N/A"
