@@ -870,6 +870,58 @@ def parse_filing_transactions(filing):
         "transaction_code": "P",
     }]
 
+def run_smoke_test(state):
+    """Low-call integration test for SEC, Polygon, Discord, and Supabase."""
+    unique_entries = []
+    seen_accessions = set()
+    for start in (0, 20, 40, 60):
+        sample_entries = _fetch_current_form4_entries(start=start, count=20)
+        for filing in sample_entries:
+            accession = filing.get("accessionNo") or ""
+            if not accession or accession in seen_accessions:
+                continue
+            seen_accessions.add(accession)
+            unique_entries.append(filing)
+        if len(unique_entries) >= 60:
+            break
+
+    parsed_txns = []
+    sample_accession = None
+    sample_ticker = None
+
+    for filing in unique_entries:
+        filing["filename"] = _href_to_filename(filing["href"])
+        xml_text = _fetch_filing_xml(filing["filename"])
+        if not xml_text:
+            continue
+        filing["xml_text"] = xml_text
+        txns = parse_filing_transactions(filing)
+        if not txns:
+            continue
+        parsed_txns = txns
+        sample_accession = filing.get("accession_display") or filing.get("accessionNo")
+        sample_ticker = txns[0].get("ticker") or ""
+        _upsert_transactions_to_supabase(filing, txns)
+        break
+
+    spy_r3m = get_spy_r3m()
+    supabase_state = "enabled" if supabase_enabled() else "disabled"
+    lines = [
+        f"SEC entries checked: {len(unique_entries)}",
+        f"Parsed purchases: {len(parsed_txns)}",
+        f"Supabase: {supabase_state}",
+        f"Polygon SPY r3m: {spy_r3m*100:+.1f}%" if spy_r3m is not None else "Polygon SPY r3m: unavailable",
+    ]
+    if sample_accession:
+        lines.append(f"Sample accession: {sample_accession}")
+    if sample_ticker:
+        lines.append(f"Sample ticker: {sample_ticker}")
+
+    discord_send("🧪 InsiderEdge Smoke Test", "\n".join(lines), 0x3498DB)
+    log("Smoke test sent to Discord")
+    log(" | ".join(lines))
+    state["last_smoke_test_time"] = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S")
+
 # ── V15 SCORING ───────────────────────────────────────────────────────────────
 
 def get_days_to_earnings(ticker, as_of_date_str):
@@ -1478,6 +1530,10 @@ def run_cycle(mode="scan"):
                 + (pos_lines if positions else ""),
                 0x2C2F33
             )
+            return
+
+        if mode == "smoke":
+            run_smoke_test(state)
             return
 
         if mode == "summary":

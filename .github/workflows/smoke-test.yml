@@ -1,0 +1,53 @@
+name: Smoke Test
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/smoke-test.yml
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate secrets
+        id: secrets
+        env:
+          POLYGON_KEY: ${{ secrets.POLYGON_KEY }}
+          DISCORD_URL: ${{ secrets.DISCORD_URL }}
+          SEC_USER_AGENT: ${{ secrets.SEC_USER_AGENT }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: |
+          missing=()
+          for name in POLYGON_KEY DISCORD_URL SEC_USER_AGENT SUPABASE_URL SUPABASE_SERVICE_ROLE_KEY; do
+            if [ -z "${!name}" ]; then
+              missing+=("$name")
+            fi
+          done
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "Missing secrets: ${missing[*]}"
+            exit 1
+          fi
+          echo "ready=true" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-python@v5
+        if: steps.secrets.outputs.ready == 'true'
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      - if: steps.secrets.outputs.ready == 'true'
+        run: pip install requests
+      - name: Run smoke test
+        if: steps.secrets.outputs.ready == 'true'
+        env:
+          POLYGON_KEY: ${{ secrets.POLYGON_KEY }}
+          DISCORD_URL: ${{ secrets.DISCORD_URL }}
+          SEC_USER_AGENT: ${{ secrets.SEC_USER_AGENT }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: python bot_v17.py --mode smoke

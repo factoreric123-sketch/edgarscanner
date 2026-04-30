@@ -4,6 +4,53 @@ import bot_v17
 
 
 class BotSignalPolicyTests(unittest.TestCase):
+    def test_smoke_mode_parser_shape(self):
+        filing = {
+            "accessionNo": "000123456789012345",
+            "filedAt": "2026-04-30T00:00:00",
+            "xml_text": """<?xml version="1.0"?>
+<ownershipDocument>
+  <periodOfReport>2026-04-29</periodOfReport>
+  <issuer>
+    <issuerCik>0000123456</issuerCik>
+    <issuerName>Example Issuer</issuerName>
+    <issuerTradingSymbol>ABCD</issuerTradingSymbol>
+  </issuer>
+  <reportingOwner>
+    <reportingOwnerRelationship>
+      <isDirector>1</isDirector>
+      <isOfficer>0</isOfficer>
+      <isTenPercentOwner>0</isTenPercentOwner>
+      <officerTitle></officerTitle>
+    </reportingOwnerRelationship>
+    <reportingOwnerId>
+      <rptOwnerName>Jane Insider</rptOwnerName>
+    </reportingOwnerId>
+  </reportingOwner>
+  <nonDerivativeTable>
+    <nonDerivativeTransaction>
+      <transactionCoding>
+        <transactionCode>P</transactionCode>
+      </transactionCoding>
+      <transactionAmounts>
+        <transactionShares>
+          <value>1000</value>
+        </transactionShares>
+        <transactionPricePerShare>
+          <value>75</value>
+        </transactionPricePerShare>
+      </transactionAmounts>
+    </nonDerivativeTransaction>
+  </nonDerivativeTable>
+</ownershipDocument>""",
+        }
+
+        txns = bot_v17.parse_filing_transactions(filing)
+
+        self.assertEqual(txns[0]["issuer_name"], "Example Issuer")
+        self.assertEqual(txns[0]["cik"], "0000123456")
+        self.assertFalse(txns[0]["is_ten_percent_owner"])
+
     def test_parse_filing_transactions_uses_cached_transactions(self):
         filing = {
             "cached_transactions": [{
