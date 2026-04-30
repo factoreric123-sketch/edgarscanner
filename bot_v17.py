@@ -18,7 +18,8 @@ v15 fix:
 - Added `timezone` to datetime imports (fixes: datetime.datetime has no attribute 'timezone')
 """
 
-import requests, json, os, time
+import requests, json, os, time, re
+import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 from collections import defaultdict
 
@@ -28,13 +29,15 @@ from collections import defaultdict
 # In GitHub Actions: set these as repo secrets
 # Locally / PythonAnywhere: can still hardcode below or use .env
 import os as _os
-SEC_API_KEY   = _os.getenv("SEC_API_KEY")
 POLYGON_KEY   = _os.getenv("POLYGON_KEY")
 POLYGON_BASE  = "https://api.polygon.io"
 ALPACA_KEY    = _os.getenv("ALPACA_KEY")
 ALPACA_SECRET = _os.getenv("ALPACA_SECRET")
 ALPACA_BASE   = "https://paper-api.alpaca.markets"
 DISCORD_URL   = _os.getenv("DISCORD_URL")
+SEC_USER_AGENT = _os.getenv("SEC_USER_AGENT") or "InsiderEdge/1.0 (contact: support@example.com)"
+SUPABASE_URL  = (_os.getenv("SUPABASE_URL") or "").rstrip("/")
+SUPABASE_SERVICE_ROLE_KEY = _os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 
 # ── V15 CONFIG ────────────────────────────────────────────────────────────────
 
@@ -93,6 +96,26 @@ def sf(v, d=0.0):
 def log(msg):
     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}", flush=True)
 
+def sec_headers():
+    return {
+        "User-Agent": SEC_USER_AGENT,
+        "Accept-Encoding": "gzip, deflate",
+        "Host": "www.sec.gov",
+    }
+
+def supabase_enabled():
+    return bool(SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY)
+
+def supabase_headers(prefer=None):
+    headers = {
+        "apikey": SUPABASE_SERVICE_ROLE_KEY,
+        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+        "Content-Type": "application/json",
+    }
+    if prefer:
+        headers["Prefer"] = prefer
+    return headers
+
 def _score_floor(cluster, spy_r3m):
     if not cluster:
         return SOLO_MIN_SCORE
@@ -128,6 +151,9 @@ def save_state(state):
 # ── DISCORD ───────────────────────────────────────────────────────────────────
 
 def discord_send(title, body, color=0x5865F2):
+    if not DISCORD_URL:
+        log("Discord webhook not configured; skipping Discord notification")
+        return
     try:
         requests.post(DISCORD_URL,
             json={"embeds": [{"title": title[:256], "description": body[:4096], "color": color}]},
@@ -466,92 +492,383 @@ def get_current_price_and_change(ticker):
 def get_sector(ticker):          return "N/A"
 def get_financial_health(ticker): return True, "fmp_removed"
 
-# ── SEC API ───────────────────────────────────────────────────────────────────
+# ── SEC EDGAR ─────────────────────────────────────────────────────────────────
+
+SEC_ARCHIVES_BASE = "https://www.sec.gov/Archives/edgar"
+ATOM_NS = {"atom": "http://www.w3.org/2005/Atom"}
+
+def _supabase_transaction_to_txn(row):
+    return {
+        "ticker": (row.get("ticker") or "").strip(),
+        "accession": (row.get("accession") or "").strip(),
+        "filed_at": (row.get("filed_at") or "")[:10],
+        "name": (row.get("reporting_owner_name") or "").strip(),
+        "title": (row.get("reporting_owner_title") or "").strip(),
+        "is_10b5": bool(row.get("is_10b5")),
+        "value": sf(row.get("transaction_value")),
+        "shares": sf(row.get("shares")),
+        "price_per_share": sf(row.get("price_per_share")),
+        "issuer_name": row.get("issuer_name") or "",
+        "cik": row.get("cik") or "",
+        "is_director": bool(row.get("is_director")),
+        "is_officer": bool(row.get("is_officer")),
+        "is_ten_percent_owner": bool(row.get("is_ten_percent_owner")),
+        "transaction_code": row.get("transaction_code") or "P",
+    }
+
+def _fetch_cached_transactions(accessions):
+    if not supabase_enabled() or not accessions:
+        return {}
+    try:
+        select_cols = ",".join([
+            "accession",
+            "filed_at",
+            "ticker",
+            "issuer_name",
+            "cik",
+            "reporting_owner_name",
+            "reporting_owner_title",
+            "is_director",
+            "is_officer",
+            "is_ten_percent_owner",
+            "transaction_code",
+            "is_10b5",
+            "shares",
+            "price_per_share",
+            "transaction_value",
+            "sec_updated_at",
+            "filing_href",
+            "filing_filename",
+        ])
+        params = {
+            "select": select_cols,
+            "accession": f"in.({','.join(sorted(set(accessions)))})",
+            "order": "filed_at.asc",
+        }
+        r = requests.get(
+            f"{SUPABASE_URL}/rest/v1/insider_form4_filings",
+            headers=supabase_headers(),
+            params=params,
+            timeout=20,
+        )
+        if r.status_code != 200:
+            log(f"Supabase fetch cache -> {r.status_code}: {r.text[:200]}")
+            return {}
+        rows = r.json()
+    except Exception as e:
+        log(f"Supabase fetch cache error: {e}")
+        return {}
+
+    grouped = defaultdict(list)
+    for row in rows:
+        grouped[(row.get("accession") or "").strip()].append(row)
+    return grouped
+
+def _upsert_transactions_to_supabase(filing, txns):
+    if not supabase_enabled() or not txns:
+        return
+    rows = []
+    for txn in txns:
+        rows.append({
+            "accession": txn.get("accession") or "",
+            "filing_href": filing.get("href") or "",
+            "filing_filename": filing.get("filename") or "",
+            "filed_at": txn.get("filed_at") or "",
+            "sec_updated_at": filing.get("updatedAt") or None,
+            "ticker": txn.get("ticker") or "",
+            "issuer_name": txn.get("issuer_name") or "",
+            "cik": txn.get("cik") or "",
+            "reporting_owner_name": txn.get("name") or "",
+            "reporting_owner_title": txn.get("title") or "",
+            "is_director": bool(txn.get("is_director")),
+            "is_officer": bool(txn.get("is_officer")),
+            "is_ten_percent_owner": bool(txn.get("is_ten_percent_owner")),
+            "transaction_code": txn.get("transaction_code") or "P",
+            "is_10b5": bool(txn.get("is_10b5")),
+            "shares": txn.get("shares") or 0,
+            "price_per_share": txn.get("price_per_share") or 0,
+            "transaction_value": txn.get("value") or 0,
+            "raw_xml": filing.get("xml_text") or "",
+            "raw_json": {
+                "accession_display": filing.get("accession_display"),
+                "title": filing.get("title"),
+                "updated_at": filing.get("updatedAt"),
+            },
+        })
+    try:
+        r = requests.post(
+            f"{SUPABASE_URL}/rest/v1/insider_form4_filings?on_conflict=accession,reporting_owner_name,ticker",
+            headers=supabase_headers(prefer="resolution=merge-duplicates,return=minimal"),
+            json=rows,
+            timeout=20,
+        )
+        if r.status_code not in (200, 201):
+            log(f"Supabase upsert -> {r.status_code}: {r.text[:200]}")
+    except Exception as e:
+        log(f"Supabase upsert error: {e}")
+
+def _fetch_current_form4_entries(start=0, count=100):
+    url = (
+        "https://www.sec.gov/cgi-bin/browse-edgar"
+        f"?action=getcurrent&type=4&owner=only&start={start}&count={count}&output=atom"
+    )
+    try:
+        r = requests.get(url, headers=sec_headers(), timeout=30)
+        if r.status_code != 200:
+            log(f"SEC current feed -> {r.status_code} (start={start})")
+            return []
+        root = ET.fromstring(r.text)
+    except Exception as e:
+        log(f"SEC current feed error: {e}")
+        return []
+
+    entries = []
+    for entry in root.findall("atom:entry", ATOM_NS):
+        href = ""
+        for link in entry.findall("atom:link", ATOM_NS):
+            if link.attrib.get("rel") == "alternate":
+                href = link.attrib.get("href", "")
+                break
+        summary = entry.findtext("atom:summary", default="", namespaces=ATOM_NS)
+        updated = entry.findtext("atom:updated", default="", namespaces=ATOM_NS)
+        title = entry.findtext("atom:title", default="", namespaces=ATOM_NS)
+        acc_match = re.search(r"AccNo:</b>\s*([0-9\-]+)", summary)
+        filed_match = re.search(r"Filed:</b>\s*([0-9]{4}-[0-9]{2}-[0-9]{2})", summary)
+        if not href or not acc_match or not filed_match:
+            continue
+        accession = acc_match.group(1)
+        entries.append({
+            "accessionNo": accession.replace("-", ""),
+            "accession_display": accession,
+            "filedAt": f"{filed_match.group(1)}T00:00:00",
+            "updatedAt": updated,
+            "href": href,
+            "title": title,
+            "form_type": "4",
+        })
+    return entries
+
+def _filing_directory_url(filename):
+    path = filename.strip()
+    if path.endswith(".txt"):
+        path = path.rsplit("/", 1)[0]
+    return f"https://www.sec.gov/Archives/{path}"
+
+def _fetch_filing_index_json(filename):
+    url = f"{_filing_directory_url(filename)}/index.json"
+    try:
+        r = requests.get(url, headers=sec_headers(), timeout=30)
+        if r.status_code != 200:
+            log(f"SEC filing index -> {r.status_code}: {url}")
+            return None
+        return r.json()
+    except Exception as e:
+        log(f"SEC filing index error: {e}")
+        return None
+
+def _pick_filing_xml(index_json):
+    directory = index_json.get("directory") or {}
+    item_list = directory.get("item") or []
+    xml_names = []
+    for item in item_list:
+        name = (item.get("name") or "").strip()
+        if not name.lower().endswith(".xml"):
+            continue
+        lower_name = name.lower()
+        if lower_name.endswith("index.xml") or lower_name.endswith("_xsl.xml"):
+            continue
+        xml_names.append(name)
+    preferred = []
+    for name in xml_names:
+        lower_name = name.lower()
+        if "ownership" in lower_name or "form4" in lower_name or lower_name.endswith(".xml"):
+            preferred.append(name)
+    picks = preferred or xml_names
+    return picks[0] if picks else None
+
+def _fetch_filing_xml(filename):
+    index_json = _fetch_filing_index_json(filename)
+    if not index_json:
+        return None
+    xml_name = _pick_filing_xml(index_json)
+    if not xml_name:
+        return None
+    url = f"{_filing_directory_url(filename)}/{xml_name}"
+    try:
+        r = requests.get(url, headers=sec_headers(), timeout=30)
+        if r.status_code != 200:
+            log(f"SEC filing xml -> {r.status_code}: {url}")
+            return None
+        return r.text
+    except Exception as e:
+        log(f"SEC filing xml error: {e}")
+        return None
+
+def _xml_text(node, path, default=""):
+    found = node.find(path)
+    if found is None or found.text is None:
+        return default
+    return found.text.strip()
+
+def _clean_accession(filename):
+    tail = filename.rsplit("/", 1)[-1]
+    acc = tail[:-4] if tail.lower().endswith(".txt") else tail
+    return acc.replace("-", "")
+
+def _href_to_filename(href):
+    path = href.replace("https://www.sec.gov/Archives/", "").replace("-index.htm", ".txt")
+    return path
+
+def _parse_sec_updated_at(value):
+    try:
+        return datetime.fromisoformat(value).astimezone(timezone.utc).replace(tzinfo=None)
+    except Exception:
+        return None
 
 def fetch_form4_filings(state, hours_back=20):
-    """Fetch only filings since last scan — prevents missing filings due to size cap."""
+    """Fetch recent Form 4 filings directly from free SEC EDGAR indexes."""
     last = state.get("last_scan_time")
     if last:
-        since = last
-    else:
-        since = (datetime.utcnow() - timedelta(hours=hours_back)).strftime("%Y-%m-%dT%H:%M:%S")
-
-    all_filings = []
-    page_size   = 50
-    from_idx    = 0
-    while True:
-        payload = {
-            "query": f'filedAt:["{since}" TO *]',
-            "from":  str(from_idx),
-            "size":  str(page_size),
-            "sort":  [{"filedAt": {"order": "asc"}}],
-        }
         try:
-            r = requests.post("https://api.sec-api.io/insider-trading",
-                              headers={"Authorization": SEC_API_KEY},
-                              json=payload, timeout=30)
-            log(f"SEC API → {r.status_code} (from={from_idx})")
-            if r.status_code != 200:
-                log(f"SEC API body: {r.text[:300]}")
-                break
-            data     = r.json()
-            batch    = data.get("transactions", [])
-            total    = data.get("total", {}).get("value", 0)
-            all_filings.extend(batch)
-            from_idx += len(batch)
-            if from_idx >= total or not batch:
-                break
-        except Exception as e:
-            log(f"SEC API error: {e}")
+            since_dt = datetime.strptime(last, "%Y-%m-%dT%H:%M:%S")
+        except Exception:
+            since_dt = datetime.utcnow() - timedelta(hours=hours_back)
+    else:
+        since_dt = datetime.utcnow() - timedelta(hours=hours_back)
+
+    since = since_dt.strftime("%Y-%m-%dT%H:%M:%S")
+    all_filings = []
+    seen_accessions = set()
+    page_size = 40
+    max_pages = 10
+    for page in range(max_pages):
+        entries = _fetch_current_form4_entries(start=page * page_size, count=page_size)
+        if not entries:
+            break
+        cached_by_accession = _fetch_cached_transactions(
+            [entry["accessionNo"] for entry in entries if entry.get("accessionNo")]
+        )
+        reached_old_entries = False
+        for filing in entries:
+            if filing["accessionNo"] in seen_accessions:
+                continue
+            seen_accessions.add(filing["accessionNo"])
+            updated_dt = _parse_sec_updated_at(filing.get("updatedAt") or "")
+            if updated_dt and updated_dt < since_dt:
+                reached_old_entries = True
+                continue
+            cached_rows = cached_by_accession.get(filing["accessionNo"], [])
+            if cached_rows:
+                filing["cached_transactions"] = [
+                    _supabase_transaction_to_txn(row) for row in cached_rows
+                ]
+                first = cached_rows[0]
+                filing["href"] = first.get("filing_href") or filing.get("href") or ""
+                filing["filename"] = first.get("filing_filename") or _href_to_filename(filing["href"])
+                all_filings.append(filing)
+                continue
+            filing["filename"] = _href_to_filename(filing["href"])
+            xml_text = _fetch_filing_xml(filing["filename"])
+            if not xml_text:
+                continue
+            filing["xml_text"] = xml_text
+            txns = parse_filing_transactions(filing)
+            if txns:
+                filing["cached_transactions"] = txns
+                _upsert_transactions_to_supabase(filing, txns)
+            all_filings.append(filing)
+        if reached_old_entries:
             break
 
-    # Update last scan time to now
+    all_filings.sort(key=lambda x: x.get("filedAt", ""))
     state["last_scan_time"] = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S")
-    log(f"  insider-trading: {len(all_filings)} filings since {since}")
+    log(f"  edgar form4: {len(all_filings)} filings since {since}")
     return all_filings
 
 def parse_filing_transactions(filing):
-    """Parse /insider-trading endpoint response — different field names from search endpoint."""
-    txns   = []
-    issuer = filing.get("issuer") or {}
-    ticker = (issuer.get("tradingSymbol") or filing.get("ticker") or "").strip()
-    if not ticker: return []
+    """Parse EDGAR Form 4 XML into the compact transaction shape used by the bot."""
+    cached_transactions = filing.get("cached_transactions")
+    if cached_transactions is not None:
+        return [dict(txn) for txn in cached_transactions]
+    xml_text = filing.get("xml_text") or ""
+    if not xml_text:
+        return []
+    try:
+        root = ET.fromstring(xml_text)
+    except Exception as e:
+        log(f"Form 4 XML parse error: {e}")
+        return []
+
+    ticker = _xml_text(root, ".//issuerTradingSymbol")
+    if not ticker:
+        return []
+
     accession = filing.get("accessionNo", "")
-    filed_at  = (filing.get("filedAt", "") or "")[:10]
-    if not filed_at: return []
-    owner = filing.get("reportingOwner") or {}
-    rel   = owner.get("relationship") or {}
-    name  = (owner.get("name") or "").strip()
-    title = (rel.get("officerTitle") or "").strip()
+    filed_at = _xml_text(root, ".//periodOfReport") or (filing.get("filedAt", "") or "")[:10]
+    if not filed_at:
+        return []
+
+    owner = root.find(".//reportingOwner")
+    owner_name = _xml_text(owner, ".//rptOwnerName") if owner is not None else ""
+    title = _xml_text(owner, ".//officerTitle") if owner is not None else ""
+    is_director = _xml_text(owner, ".//isDirector") == "1" if owner is not None else False
+    is_officer = _xml_text(owner, ".//isOfficer") == "1" if owner is not None else False
+    is_ten_percent_owner = _xml_text(owner, ".//isTenPercentOwner") == "1" if owner is not None else False
     if not title:
-        title = "Director" if rel.get("isDirector") else ("Officer" if rel.get("isOfficer") else "")
-    ndt      = filing.get("nonDerivativeTable") or {}
-    txn_list = ndt.get("transactions", [])
-    for txn in txn_list:
-        code = (txn.get("coding", {}).get("code") or "").upper()
-        if code != "P": continue
-        amounts = txn.get("amounts") or {}
+        title = "Director" if is_director else ("Officer" if is_officer else "")
+    issuer_name = _xml_text(root, ".//issuerName")
+    cik = _xml_text(root, ".//issuerCik")
+
+    footnote_map = {}
+    for footnote in root.findall(".//footnote"):
+        foot_id = footnote.attrib.get("id")
+        if foot_id:
+            footnote_map[foot_id] = (footnote.text or "").strip()
+
+    filing_footnotes = " ".join(footnote_map.values())
+    total_shares = 0.0
+    total_value = 0.0
+    any_10b5 = False
+    for txn in root.findall(".//nonDerivativeTransaction"):
+        code = _xml_text(txn, ".//transactionCode").upper()
+        if code != "P":
+            continue
         try:
-            shares = abs(float(amounts.get("shares") or 0))
-            price  = float(amounts.get("pricePerShare") or 0)
-        except: continue
+            shares = abs(float(_xml_text(txn, ".//transactionShares/value", "0") or 0))
+            price = float(_xml_text(txn, ".//transactionPricePerShare/value", "0") or 0)
+        except Exception:
+            continue
         value = shares * price
-        if value < 50_000: continue
-        coding    = txn.get("coding") or {}
-        footnotes = str(txn.get("footnotes","")) + str(filing.get("footnotes",""))
-        is_10b5   = bool(coding.get("planFlag") or coding.get("plan") or
-                         "10b5" in footnotes.lower() or
-                         str(coding.get("code","")).lower() == "a")
-        txns.append({
-            "ticker":    ticker,
-            "accession": accession,
-            "filed_at":  filed_at,
-            "name":      name,
-            "title":     title,
-            "is_10b5":   is_10b5,
-            "value":     value,
-        })
-    return txns
+        if value < 50_000:
+            continue
+        footnote_ids = [ref.attrib.get("id", "") for ref in txn.findall(".//footnoteId")]
+        txn_footnotes = " ".join(footnote_map.get(fid, "") for fid in footnote_ids)
+        all_footnotes = f"{txn_footnotes} {filing_footnotes}".lower()
+        any_10b5 = any_10b5 or ("10b5" in all_footnotes or "10b5-1" in all_footnotes)
+        total_shares += shares
+        total_value += value
+
+    if total_value < 50_000 or total_shares <= 0:
+        return []
+
+    avg_price = total_value / total_shares if total_shares else 0.0
+    return [{
+        "ticker": ticker.strip(),
+        "accession": accession,
+        "filed_at": filed_at[:10],
+        "name": owner_name.strip(),
+        "title": title.strip(),
+        "is_10b5": any_10b5,
+        "value": total_value,
+        "shares": total_shares,
+        "price_per_share": avg_price,
+        "issuer_name": issuer_name,
+        "cik": cik,
+        "is_director": is_director,
+        "is_officer": is_officer,
+        "is_ten_percent_owner": is_ten_percent_owner,
+        "transaction_code": "P",
+    }]
 
 # ── V15 SCORING ───────────────────────────────────────────────────────────────
 
@@ -1133,16 +1450,16 @@ def run_cycle(mode="scan"):
       summary   = post daily summary
     """
     import sys
-    log("=" * 55)
-    log(f"InsiderEdge v16 — {mode.upper()} cycle")
-    log("=" * 55)
-
-    state  = load_state()
-    equity = get_equity()
-    now    = datetime.now()
-    log(f"Equity: ${equity:,.0f} | Open: {list(state['positions'].keys())} | Queued: {len(state.get('pending_trades',{}))}")
-
+    state = load_state()
     try:
+        log("=" * 55)
+        log(f"InsiderEdge v16 — {mode.upper()} cycle")
+        log("=" * 55)
+
+        equity = get_equity()
+        now    = datetime.now()
+        log(f"Equity: ${equity:,.0f} | Open: {list(state['positions'].keys())} | Queued: {len(state.get('pending_trades',{}))}")
+
         if mode == "heartbeat":
             spy_r3m   = get_spy_r3m()
             positions = state.get("positions", {})

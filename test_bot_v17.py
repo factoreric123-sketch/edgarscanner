@@ -4,6 +4,81 @@ import bot_v17
 
 
 class BotSignalPolicyTests(unittest.TestCase):
+    def test_parse_filing_transactions_uses_cached_transactions(self):
+        filing = {
+            "cached_transactions": [{
+                "ticker": "CACHE",
+                "accession": "123",
+                "filed_at": "2026-04-30",
+                "name": "Cached Owner",
+                "title": "Director",
+                "is_10b5": False,
+                "value": 80000,
+            }]
+        }
+
+        txns = bot_v17.parse_filing_transactions(filing)
+
+        self.assertEqual(len(txns), 1)
+        self.assertEqual(txns[0]["ticker"], "CACHE")
+        self.assertEqual(txns[0]["value"], 80000)
+
+    def test_parse_filing_transactions_from_edgar_xml(self):
+        filing = {
+            "accessionNo": "000123456789012345",
+            "filedAt": "2026-04-30T00:00:00",
+            "xml_text": """<?xml version="1.0"?>
+<ownershipDocument>
+  <periodOfReport>2026-04-29</periodOfReport>
+  <issuer>
+    <issuerTradingSymbol>ABCD</issuerTradingSymbol>
+  </issuer>
+  <reportingOwner>
+    <reportingOwnerRelationship>
+      <isDirector>1</isDirector>
+      <isOfficer>0</isOfficer>
+      <officerTitle></officerTitle>
+    </reportingOwnerRelationship>
+    <reportingOwnerId>
+      <rptOwnerName>Jane Insider</rptOwnerName>
+    </reportingOwnerId>
+  </reportingOwner>
+  <footnotes>
+    <footnote id="F1">Adopted pursuant to Rule 10b5-1.</footnote>
+  </footnotes>
+  <nonDerivativeTable>
+    <nonDerivativeTransaction>
+      <transactionCoding>
+        <transactionCode>P</transactionCode>
+      </transactionCoding>
+      <transactionAmounts>
+        <transactionShares>
+          <value>1000</value>
+        </transactionShares>
+        <transactionPricePerShare>
+          <value>75</value>
+        </transactionPricePerShare>
+      </transactionAmounts>
+      <footnoteId id="F1" />
+    </nonDerivativeTransaction>
+  </nonDerivativeTable>
+</ownershipDocument>""",
+        }
+
+        txns = bot_v17.parse_filing_transactions(filing)
+
+        self.assertEqual(len(txns), 1)
+        self.assertEqual(txns[0]["ticker"], "ABCD")
+        self.assertEqual(txns[0]["accession"], "000123456789012345")
+        self.assertEqual(txns[0]["filed_at"], "2026-04-29")
+        self.assertEqual(txns[0]["name"], "Jane Insider")
+        self.assertEqual(txns[0]["title"], "Director")
+        self.assertTrue(txns[0]["is_10b5"])
+        self.assertEqual(txns[0]["value"], 75_000)
+        self.assertEqual(txns[0]["shares"], 1000)
+        self.assertEqual(txns[0]["price_per_share"], 75)
+        self.assertTrue(txns[0]["is_director"])
+
     def test_pre5_does_not_rescue_sub_floor_solo_signal(self):
         score, comp = bot_v17.score_signal(
             value=106_152,

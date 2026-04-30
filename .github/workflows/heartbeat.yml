@@ -13,21 +13,48 @@ jobs:
     timeout-minutes: 2
     steps:
       - uses: actions/checkout@v4
+      - name: Validate secrets
+        id: secrets
+        env:
+          POLYGON_KEY: ${{ secrets.POLYGON_KEY }}
+          ALPACA_KEY: ${{ secrets.ALPACA_KEY }}
+          ALPACA_SECRET: ${{ secrets.ALPACA_SECRET }}
+          DISCORD_URL: ${{ secrets.DISCORD_URL }}
+          SEC_USER_AGENT: ${{ secrets.SEC_USER_AGENT }}
+        run: |
+          missing=()
+          for name in POLYGON_KEY ALPACA_KEY ALPACA_SECRET DISCORD_URL; do
+            if [ -z "${!name}" ]; then
+              missing+=("$name")
+            fi
+          done
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "Skipping heartbeat; missing secrets: ${missing[*]}"
+          else
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          fi
       - uses: actions/setup-python@v5
+        if: steps.secrets.outputs.ready == 'true'
         with:
           python-version: '3.11'
-      - run: pip install requests
+      - if: steps.secrets.outputs.ready == 'true'
+        run: pip install requests
       - name: Restore state
+        if: steps.secrets.outputs.ready == 'true'
         uses: actions/cache@v4
         with:
           path: bot_v15_state.json
           key: insideredge-state-${{ github.run_id }}
           restore-keys: insideredge-state-
       - name: Send heartbeat
+        if: steps.secrets.outputs.ready == 'true'
         env:
-          SEC_API_KEY:   ${{ secrets.SEC_API_KEY }}
           POLYGON_KEY:   ${{ secrets.POLYGON_KEY }}
           ALPACA_KEY:    ${{ secrets.ALPACA_KEY }}
           ALPACA_SECRET: ${{ secrets.ALPACA_SECRET }}
           DISCORD_URL:   ${{ secrets.DISCORD_URL }}
+          SEC_USER_AGENT: ${{ secrets.SEC_USER_AGENT }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
         run: python bot_v17.py --mode heartbeat
