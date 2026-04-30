@@ -1,9 +1,25 @@
 import unittest
+from datetime import datetime, timezone
 
 import bot_v17
 
 
 class BotSignalPolicyTests(unittest.TestCase):
+    def test_get_equity_returns_none_when_alpaca_disabled(self):
+        old_key = bot_v17.ALPACA_KEY
+        old_secret = bot_v17.ALPACA_SECRET
+        try:
+            bot_v17.ALPACA_KEY = None
+            bot_v17.ALPACA_SECRET = None
+            self.assertIsNone(bot_v17.get_equity())
+        finally:
+            bot_v17.ALPACA_KEY = old_key
+            bot_v17.ALPACA_SECRET = old_secret
+
+    def test_fallback_market_hours_detects_weekend_closed(self):
+        sunday_noon_utc = datetime(2026, 5, 3, 16, 0, tzinfo=timezone.utc)
+        self.assertFalse(bot_v17._fallback_market_open(sunday_noon_utc))
+
     def test_smoke_mode_parser_shape(self):
         filing = {
             "accessionNo": "000123456789012345",

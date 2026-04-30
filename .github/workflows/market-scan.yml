@@ -28,13 +28,11 @@ jobs:
         id: secrets
         env:
           POLYGON_KEY: ${{ secrets.POLYGON_KEY }}
-          ALPACA_KEY: ${{ secrets.ALPACA_KEY }}
-          ALPACA_SECRET: ${{ secrets.ALPACA_SECRET }}
           DISCORD_URL: ${{ secrets.DISCORD_URL }}
           SEC_USER_AGENT: ${{ secrets.SEC_USER_AGENT }}
         run: |
           missing=()
-          for name in POLYGON_KEY ALPACA_KEY ALPACA_SECRET DISCORD_URL; do
+          for name in POLYGON_KEY DISCORD_URL SEC_USER_AGENT; do
             if [ -z "${!name}" ]; then
               missing+=("$name")
             fi

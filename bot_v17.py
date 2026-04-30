@@ -22,6 +22,7 @@ import requests, json, os, time, re
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 from collections import defaultdict
+from zoneinfo import ZoneInfo
 
 # ── CREDENTIALS ───────────────────────────────────────────────────────────────
 
@@ -102,6 +103,24 @@ def sec_headers():
         "Accept-Encoding": "gzip, deflate",
         "Host": "www.sec.gov",
     }
+
+def alpaca_enabled():
+    return bool(ALPACA_KEY and ALPACA_SECRET)
+
+def trading_enabled():
+    return alpaca_enabled()
+
+def _equity_label(equity):
+    return f"${equity:,.0f}" if equity is not None else "N/A (trading disabled)"
+
+def _fallback_market_open(now_utc=None):
+    now_utc = now_utc or datetime.now(timezone.utc)
+    ny_now = now_utc.astimezone(ZoneInfo("America/New_York"))
+    if ny_now.weekday() >= 5:
+        return False
+    open_dt = ny_now.replace(hour=9, minute=30, second=0, microsecond=0)
+    close_dt = ny_now.replace(hour=16, minute=0, second=0, microsecond=0)
+    return open_dt <= ny_now <= close_dt
 
 def supabase_enabled():
     return bool(SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY)
@@ -334,6 +353,8 @@ ALP_H = {
 }
 
 def alp_get(path):
+    if not alpaca_enabled():
+        return None
     try:
         r = requests.get(f"{ALPACA_BASE}/v2{path}", headers=ALP_H, timeout=15)
         if r.status_code == 200: return r.json()
@@ -343,6 +364,8 @@ def alp_get(path):
     return None
 
 def alp_post(path, data):
+    if not alpaca_enabled():
+        return None
     try:
         r = requests.post(f"{ALPACA_BASE}/v2{path}", headers=ALP_H, json=data, timeout=15)
         if r.status_code in (200, 201): return r.json()
@@ -352,6 +375,8 @@ def alp_post(path, data):
     return None
 
 def alp_delete(path):
+    if not alpaca_enabled():
+        return False
     try:
         r = requests.delete(f"{ALPACA_BASE}/v2{path}", headers=ALP_H, timeout=15)
         if r.status_code in (200, 204): return True
@@ -361,18 +386,26 @@ def alp_delete(path):
     return False
 
 def get_equity():
+    if not alpaca_enabled():
+        return None
     acc = alp_get("/account")
     if not acc:
-        raise RuntimeError("Alpaca auth failed — check paper key/secret")
+        log("Alpaca account unavailable; trading disabled for this run")
+        return None
     return sf(acc.get("equity", 0))
 
 def is_market_open():
+    if not alpaca_enabled():
+        return _fallback_market_open()
     clock = alp_get("/clock")
     if not clock:
-        raise RuntimeError("Alpaca clock failed — check auth")
+        log("Alpaca clock unavailable; falling back to NYSE hours")
+        return _fallback_market_open()
     return clock.get("is_open", False)
 
 def get_price_alpaca(ticker):
+    if not alpaca_enabled():
+        return 0
     data = alp_get(f"/stocks/{ticker}/trades/latest")
     if data and "trade" in data:
         p = sf(data["trade"].get("p", 0))
@@ -386,6 +419,9 @@ def get_price_alpaca(ticker):
     return 0
 
 def place_order(ticker, notional):
+    if not alpaca_enabled():
+        log(f"  Trading disabled; skip order for {ticker}")
+        return None
     # Always use whole shares — works for fractional and non-fractional stocks
     price = get_price_alpaca(ticker) or get_price_polygon(ticker)
     if not price or price <= 0:
@@ -410,6 +446,8 @@ def place_order(ticker, notional):
     return None
 
 def close_position_alpaca(ticker):
+    if not alpaca_enabled():
+        return False
     ok = alp_delete(f"/positions/{ticker}")
     if ok: log(f"  CLOSED {ticker}")
     return ok
@@ -1277,6 +1315,7 @@ def scan_filings(state):
         f"{len(by_ticker_date)} signals to evaluate")
 
     pending = state.setdefault("pending_trades", {})
+    allow_trading = trading_enabled()
 
     for (ticker, filed_date), txns in by_ticker_date.items():
 
@@ -1366,6 +1405,18 @@ def scan_filings(state):
                 avg_vol_30d, cur_px, chg,
                 reason, 0, traded=False
             )
+        elif not allow_trading:
+            log(f"    → Trading disabled | score={score:.0f}")
+            discord_send(
+                f"📡 {ticker} | SIGNAL LOGGED",
+                f"**{ticker}** signal captured from EDGAR.\n"
+                f"Insider: {name} ({title})\n"
+                f"Filed: {filed_date}\n"
+                f"Score: {score:.0f}\n"
+                f"Value: ${total_value:,.0f}\n"
+                f"Trading is disabled because Alpaca is not configured.",
+                0x3498DB
+            )
         else:
             pending[ticker] = {
                 "ticker":       ticker,
@@ -1406,6 +1457,9 @@ def scan_filings(state):
 # ── EXECUTE PENDING — runs only when market is open ───────────────────────────
 
 def execute_pending(state):
+    if not trading_enabled():
+        log("Trading disabled; clearing any queued executions for this run")
+        return
     pending = state.get("pending_trades", {})
     if not pending:
         return
@@ -1474,7 +1528,7 @@ def post_daily_summary(state, daily_trades):
     queued_line = ", ".join(queued.keys()) if queued else "None"
 
     body = (
-        f"**Equity:** ${equity:,.0f}\n"
+        f"**Equity:** {_equity_label(equity)}\n"
         f"**Regime:** {_regime_label(spy_r3m)}"
         + (f" | SPY r3m: {spy_r3m*100:+.1f}%" if spy_r3m else "")
         + "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -1510,7 +1564,10 @@ def run_cycle(mode="scan"):
 
         equity = get_equity()
         now    = datetime.now()
-        log(f"Equity: ${equity:,.0f} | Open: {list(state['positions'].keys())} | Queued: {len(state.get('pending_trades',{}))}")
+        if trading_enabled():
+            log(f"Equity: {_equity_label(equity)} | Open: {list(state['positions'].keys())} | Queued: {len(state.get('pending_trades',{}))}")
+        else:
+            log(f"Equity: {_equity_label(equity)} | Open: {list(state['positions'].keys())} | Queued: {len(state.get('pending_trades',{}))} | Trading disabled")
 
         if mode == "heartbeat":
             spy_r3m   = get_spy_r3m()
@@ -1523,10 +1580,11 @@ def run_cycle(mode="scan"):
             discord_send(
                 "💓 Heartbeat",
                 f"**{now.strftime('%b %d %H:%M')}** — GitHub Actions ✅\n"
-                f"**Equity:** ${equity:,.0f}\n"
+                f"**Equity:** {_equity_label(equity)}\n"
                 f"**Regime:** {_regime_label(spy_r3m)}"
                 + (f" | SPY r3m: {spy_r3m*100:+.1f}%" if spy_r3m else "")
                 + f"\n**Positions:** {len(positions)} | **Queued:** {len(queued)}\n"
+                + ("**Trading:** Disabled (Alpaca not configured)\n" if not trading_enabled() else "")
                 + (pos_lines if positions else ""),
                 0x2C2F33
             )
@@ -1543,9 +1601,13 @@ def run_cycle(mode="scan"):
         # scan + premarket: always scan for new filings
         scan_filings(state)
 
-        market_open = is_market_open()
+        if not trading_enabled():
+            log("Trading disabled; skipping Alpaca-dependent execution and position management")
+            market_open = False
+        else:
+            market_open = is_market_open()
 
-        if mode == "scan" and market_open:
+        if mode == "scan" and market_open and trading_enabled():
             # Execute anything queued
             execute_pending(state)
             # Check existing positions for exits
