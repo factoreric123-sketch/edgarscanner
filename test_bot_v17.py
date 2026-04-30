@@ -1,6 +1,7 @@
+import json
 import unittest
 from datetime import datetime, timezone
-from unittest.mock import patch
+from unittest.mock import patch, MagicMock
 
 import bot_v17
 
@@ -205,6 +206,73 @@ class SecEdgarIngestionTests(unittest.TestCase):
         self.assertEqual(txns[0]["filed_at"], "2026-04-29")
         self.assertEqual(txns[0]["value"], 60000.0)
         self.assertTrue(txns[0]["is_10b5"])
+
+
+    def test_fetch_normalized_form4_filing_returns_parsed_filings(self):
+        index_json = json.dumps({
+            "directory": {
+                "item": [
+                    {"name": "ownership.xml"},
+                    {"name": "primary_doc.xml"},
+                ]
+            }
+        })
+        xml_text = """<?xml version="1.0" encoding="UTF-8"?>
+<ownershipDocument>
+  <issuer>
+    <issuerCik>0009876543</issuerCik>
+    <issuerName>Test Corp</issuerName>
+    <issuerTradingSymbol>TEST</issuerTradingSymbol>
+  </issuer>
+  <reportingOwner>
+    <reportingOwnerId>
+      <rptOwnerName>John Officer</rptOwnerName>
+    </reportingOwnerId>
+    <reportingOwnerRelationship>
+      <isDirector>0</isDirector>
+      <isOfficer>1</isOfficer>
+      <officerTitle>CFO</officerTitle>
+    </reportingOwnerRelationship>
+  </reportingOwner>
+  <nonDerivativeTable>
+    <nonDerivativeTransaction>
+      <transactionCoding>
+        <transactionCode>P</transactionCode>
+      </transactionCoding>
+      <transactionAmounts>
+        <transactionShares><value>2000</value></transactionShares>
+        <transactionPricePerShare><value>75.00</value></transactionPricePerShare>
+      </transactionAmounts>
+    </nonDerivativeTransaction>
+  </nonDerivativeTable>
+</ownershipDocument>"""
+
+        entry = {
+            "accessionNo": "0009876543-26-000099",
+            "filedAt": "2026-04-30T10:00:00+00:00",
+            "link": "https://www.sec.gov/Archives/edgar/data/9876543/000987654326000099/ownership.xml",
+        }
+
+        def fake_sec_get(url, **kwargs):
+            r = MagicMock()
+            r.status_code = 200
+            if url.endswith("index.json"):
+                r.text = index_json
+                r.json = lambda: json.loads(index_json)
+            else:
+                r.text = xml_text
+            return r
+
+        with patch.object(bot_v17, "_sec_get", side_effect=fake_sec_get):
+            filings = bot_v17._fetch_normalized_form4_filing(entry)
+
+        self.assertEqual(len(filings), 1)
+        self.assertEqual(filings[0]["issuer"]["tradingSymbol"], "TEST")
+        self.assertEqual(filings[0]["reportingOwner"]["name"], "John Officer")
+        self.assertEqual(filings[0]["reportingOwner"]["relationship"]["displayTitle"], "CFO")
+        txns = bot_v17.parse_filing_transactions(filings[0])
+        self.assertEqual(len(txns), 1)
+        self.assertEqual(txns[0]["value"], 150_000.0)
 
 
 if __name__ == "__main__":

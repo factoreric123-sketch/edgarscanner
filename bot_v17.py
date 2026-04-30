@@ -20,6 +20,7 @@ v15 fix:
 
 import requests, json, os, time
 import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from collections import defaultdict
 
@@ -483,13 +484,13 @@ def _sec_get(url, timeout=20, retries=4):
         try:
             r = requests.get(url, headers=_sec_headers(), timeout=timeout)
             if r.status_code == 429:
-                time.sleep(1 + attempt)
+                time.sleep(5 * (attempt + 1))
                 continue
             return r
         except Exception:
             if attempt == retries - 1:
                 raise
-            time.sleep(1 + attempt)
+            time.sleep(5 * (attempt + 1))
     raise RuntimeError("SEC request retries exhausted")
 
 
@@ -540,7 +541,7 @@ def _parse_feed_datetime(value):
 
 
 def _is_form4_term(term):
-    return str(term or "").upper().startswith("4")
+    return str(term or "").upper() in {"4", "4/A"}
 
 
 def _fetch_current_form4_entries(since_utc):
@@ -743,22 +744,24 @@ def fetch_form4_filings(state, hours_back=20):
     filings = []
     seen_accessions = set()
     already_seen = set(state.get("seen_accessions", []))
+
+    new_entries = []
     for entry in entries:
         accession = entry.get("accessionNo", "")
         if not accession or accession in seen_accessions:
             continue
         seen_accessions.add(accession)
-
         if accession in already_seen:
-            filings.append({
-                "accessionNo": accession,
-                "filedAt": entry.get("filedAt", ""),
-            })
-            continue
+            filings.append({"accessionNo": accession, "filedAt": entry.get("filedAt", "")})
+        else:
+            new_entries.append(entry)
 
-        filings.extend(_fetch_normalized_form4_filing(entry))
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        futures = {pool.submit(_fetch_normalized_form4_filing, e): e for e in new_entries}
+        for future in as_completed(futures):
+            filings.extend(future.result())
 
-    state["last_scan_time"] = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S")
+    state["last_scan_time"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
     log(f"  EDGAR feed: {len(entries)} accessions since {since_utc.isoformat()}")
     return filings
 
