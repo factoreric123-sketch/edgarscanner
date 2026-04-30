@@ -25,6 +25,7 @@ jobs:
           restore-keys: insideredge-state-
       - name: Send heartbeat
         env:
+          SEC_API_KEY:   ${{ secrets.SEC_API_KEY }}
           POLYGON_KEY:   ${{ secrets.POLYGON_KEY }}
           ALPACA_KEY:    ${{ secrets.ALPACA_KEY }}
           ALPACA_SECRET: ${{ secrets.ALPACA_SECRET }}
