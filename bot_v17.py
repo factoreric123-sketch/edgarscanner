@@ -454,15 +454,59 @@ def close_position_alpaca(ticker):
 
 # ── POLYGON ───────────────────────────────────────────────────────────────────
 
+# Per-ticker bar cache + global throttle. Each ticker scan calls polygon_bars
+# 6× (3m return, ATR, monthly ATR, 52w high, 30d volume, current price). On
+# Polygon's 5-req/min free tier the last 1–2 calls were getting 429'd, which
+# the bare except silently swallowed and made price/volume show as N/A. The
+# cache collapses 6 calls into 1 per ticker; the throttle paces calls across
+# multiple tickers when several signals process in the same scan.
+_BARS_CACHE = {}  # ticker -> {"fetched_days": int, "bars": list}
+_LAST_POLYGON_FETCH = [0.0]
+# Free tier = 5 req/min → need ≥12s between calls. Default 13s for headroom;
+# paid tiers can lower this via env var.
+POLYGON_MIN_INTERVAL = float(_os.getenv("POLYGON_MIN_INTERVAL", "13"))
+
 def polygon_bars(ticker, days=100):
+    cached = _BARS_CACHE.get(ticker)
+    if cached and cached["fetched_days"] >= days and cached["bars"]:
+        cutoff_ms = (datetime.now() - timedelta(days=days)).timestamp() * 1000
+        sliced = [b for b in cached["bars"] if b.get("t", 0) >= cutoff_ms]
+        if sliced:
+            return sliced
+
+    elapsed = time.time() - _LAST_POLYGON_FETCH[0]
+    if elapsed < POLYGON_MIN_INTERVAL:
+        time.sleep(POLYGON_MIN_INTERVAL - elapsed)
+
     end   = datetime.now().strftime("%Y-%m-%d")
     start = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
     url   = (f"{POLYGON_BASE}/v2/aggs/ticker/{ticker}/range/1/day/"
              f"{start}/{end}?adjusted=true&sort=asc&limit=300&apiKey={POLYGON_KEY}")
-    try:
-        r = requests.get(url, timeout=15)
-        return r.json().get("results", [])
-    except: return []
+    for attempt in range(3):
+        try:
+            r = requests.get(url, timeout=15)
+        except Exception as e:
+            log(f"  Polygon network error for {ticker}: {e}")
+            _LAST_POLYGON_FETCH[0] = time.time()
+            return []
+        _LAST_POLYGON_FETCH[0] = time.time()
+        if r.status_code == 429:
+            wait = 15 * (attempt + 1)
+            log(f"  Polygon 429 for {ticker}, backing off {wait}s")
+            time.sleep(wait)
+            continue
+        if r.status_code != 200:
+            log(f"  Polygon HTTP {r.status_code} for {ticker}: {r.text[:200]}")
+            return []
+        try:
+            bars = r.json().get("results", []) or []
+        except Exception as e:
+            log(f"  Polygon JSON decode failed for {ticker}: {e}")
+            return []
+        if not cached or len(bars) >= len(cached.get("bars", [])):
+            _BARS_CACHE[ticker] = {"fetched_days": days, "bars": bars}
+        return bars
+    return []
 
 def get_3m_return(ticker):
     bars = polygon_bars(ticker, days=95)
