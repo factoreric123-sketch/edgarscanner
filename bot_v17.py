@@ -454,15 +454,71 @@ def close_position_alpaca(ticker):
 
 # ── POLYGON ───────────────────────────────────────────────────────────────────
 
+# Per-ticker bar cache + global throttle. Each ticker scan calls polygon_bars
+# 6× (3m return, ATR, monthly ATR, 52w high, 30d volume, current price). On
+# Polygon's 5-req/min free tier the last 1–2 calls were getting 429'd, which
+# the bare except silently swallowed and made price/volume show as N/A. The
+# cache collapses 6 calls into 1 per ticker; the throttle paces calls across
+# multiple tickers when several signals process in the same scan.
+_BARS_CACHE = {}  # ticker -> {"fetched_days": int, "bars": list}
+_LAST_POLYGON_FETCH = [0.0]
+# Free tier = 5 req/min → need ≥12s between calls. Default 25s assumes the
+# key is shared with one other bot (2.4 req/min each → ~4.8 combined, under
+# the 5/min cap). Solo on free: set 13. Paid: set 0.5 or lower.
+POLYGON_MIN_INTERVAL = float(_os.getenv("POLYGON_MIN_INTERVAL", "25"))
+
+def _polygon_get(url, timeout=15, label=""):
+    """Throttled GET against Polygon. Sleeps to honor POLYGON_MIN_INTERVAL,
+    retries on 429 with backoff, logs non-200. Returns parsed JSON dict or None."""
+    elapsed = time.time() - _LAST_POLYGON_FETCH[0]
+    if elapsed < POLYGON_MIN_INTERVAL:
+        time.sleep(POLYGON_MIN_INTERVAL - elapsed)
+    # Retry budget: 6 attempts × ≤60s backoff = up to ~3min wait. With a second
+    # bot sharing the key, the 5/min window can be saturated for stretches —
+    # we'd rather block this signal briefly than mark it NO_MARKET_DATA.
+    for attempt in range(6):
+        try:
+            r = requests.get(url, timeout=timeout)
+        except Exception as e:
+            log(f"  Polygon network error{(' '+label) if label else ''}: {e}")
+            _LAST_POLYGON_FETCH[0] = time.time()
+            return None
+        _LAST_POLYGON_FETCH[0] = time.time()
+        if r.status_code == 429:
+            wait = min(60, 20 * (attempt + 1))
+            log(f"  Polygon 429{(' '+label) if label else ''} (attempt {attempt+1}/6), backing off {wait}s")
+            time.sleep(wait)
+            continue
+        if r.status_code != 200:
+            log(f"  Polygon HTTP {r.status_code}{(' '+label) if label else ''}: {r.text[:200]}")
+            return None
+        try:
+            return r.json()
+        except Exception as e:
+            log(f"  Polygon JSON decode failed{(' '+label) if label else ''}: {e}")
+            return None
+    log(f"  Polygon gave up after 6× 429{(' '+label) if label else ''} — quota likely starved by other client")
+    return None
+
 def polygon_bars(ticker, days=100):
+    cached = _BARS_CACHE.get(ticker)
+    if cached and cached["fetched_days"] >= days and cached["bars"]:
+        cutoff_ms = (datetime.now() - timedelta(days=days)).timestamp() * 1000
+        sliced = [b for b in cached["bars"] if b.get("t", 0) >= cutoff_ms]
+        if sliced:
+            return sliced
+
     end   = datetime.now().strftime("%Y-%m-%d")
     start = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
     url   = (f"{POLYGON_BASE}/v2/aggs/ticker/{ticker}/range/1/day/"
              f"{start}/{end}?adjusted=true&sort=asc&limit=300&apiKey={POLYGON_KEY}")
-    try:
-        r = requests.get(url, timeout=15)
-        return r.json().get("results", [])
-    except: return []
+    data = _polygon_get(url, timeout=15, label=f"bars {ticker}")
+    if data is None:
+        return []
+    bars = data.get("results", []) or []
+    if not cached or len(bars) >= len(cached.get("bars", [])):
+        _BARS_CACHE[ticker] = {"fetched_days": days, "bars": bars}
+    return bars
 
 def get_3m_return(ticker):
     bars = polygon_bars(ticker, days=95)
@@ -966,19 +1022,17 @@ def get_days_to_earnings(ticker, as_of_date_str):
     """Returns days between filing date and nearest earnings date (negative = earnings already passed)."""
     try:
         as_of = datetime.strptime(as_of_date_str[:10], "%Y-%m-%d")
-        # Look 30 days back and 30 days forward
         from_dt = (as_of - timedelta(days=30)).strftime("%Y-%m-%d")
         to_dt   = (as_of + timedelta(days=30)).strftime("%Y-%m-%d")
         url = (f"{POLYGON_BASE}/vX/reference/financials"
                f"?ticker={ticker}&filing_date.gte={from_dt}&filing_date.lte={to_dt}"
                f"&timeframe=quarterly&limit=5&apiKey={POLYGON_KEY}")
-        r = requests.get(url, timeout=10)
-        if r.status_code != 200:
+        data = _polygon_get(url, timeout=10, label=f"earnings {ticker}")
+        if not data:
             return None
-        results = r.json().get("results", [])
+        results = data.get("results", [])
         if not results:
             return None
-        # Find closest earnings to filing date
         closest = min(results, key=lambda x: abs(
             (datetime.strptime(x["filing_date"][:10], "%Y-%m-%d") - as_of).days
         ))
@@ -995,15 +1049,16 @@ def get_pre5_return(ticker, as_of_date_str):
         url = (f"{POLYGON_BASE}/v2/aggs/ticker/{ticker}/range/1/day"
                f"/{from_dt}/{to_dt}?adjusted=true&sort=asc&limit=10"
                f"&apiKey={POLYGON_KEY}")
-        r = requests.get(url, timeout=8)
-        if r.status_code == 200:
-            bars = r.json().get("results", [])
-            last5 = bars[-5:] if len(bars) >= 5 else bars
-            if len(last5) >= 2:
-                start = last5[0].get("c", 0)
-                end   = last5[-1].get("c", 0)
-                if start > 0:
-                    return (end - start) / start
+        data = _polygon_get(url, timeout=8, label=f"pre5 {ticker}")
+        if not data:
+            return None
+        bars = data.get("results", []) or []
+        last5 = bars[-5:] if len(bars) >= 5 else bars
+        if len(last5) >= 2:
+            start = last5[0].get("c", 0)
+            end   = last5[-1].get("c", 0)
+            if start > 0:
+                return (end - start) / start
         return None
     except Exception:
         return None
