@@ -462,9 +462,10 @@ def close_position_alpaca(ticker):
 # multiple tickers when several signals process in the same scan.
 _BARS_CACHE = {}  # ticker -> {"fetched_days": int, "bars": list}
 _LAST_POLYGON_FETCH = [0.0]
-# Free tier = 5 req/min → need ≥12s between calls. Default 13s for headroom;
-# paid tiers can lower this via env var.
-POLYGON_MIN_INTERVAL = float(_os.getenv("POLYGON_MIN_INTERVAL", "13"))
+# Free tier = 5 req/min → need ≥12s between calls. Default 25s assumes the
+# key is shared with one other bot (2.4 req/min each → ~4.8 combined, under
+# the 5/min cap). Solo on free: set 13. Paid: set 0.5 or lower.
+POLYGON_MIN_INTERVAL = float(_os.getenv("POLYGON_MIN_INTERVAL", "25"))
 
 def _polygon_get(url, timeout=15, label=""):
     """Throttled GET against Polygon. Sleeps to honor POLYGON_MIN_INTERVAL,
