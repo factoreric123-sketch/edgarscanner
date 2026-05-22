@@ -473,7 +473,10 @@ def _polygon_get(url, timeout=15, label=""):
     elapsed = time.time() - _LAST_POLYGON_FETCH[0]
     if elapsed < POLYGON_MIN_INTERVAL:
         time.sleep(POLYGON_MIN_INTERVAL - elapsed)
-    for attempt in range(3):
+    # Retry budget: 6 attempts × ≤60s backoff = up to ~3min wait. With a second
+    # bot sharing the key, the 5/min window can be saturated for stretches —
+    # we'd rather block this signal briefly than mark it NO_MARKET_DATA.
+    for attempt in range(6):
         try:
             r = requests.get(url, timeout=timeout)
         except Exception as e:
@@ -482,8 +485,8 @@ def _polygon_get(url, timeout=15, label=""):
             return None
         _LAST_POLYGON_FETCH[0] = time.time()
         if r.status_code == 429:
-            wait = 15 * (attempt + 1)
-            log(f"  Polygon 429{(' '+label) if label else ''}, backing off {wait}s")
+            wait = min(60, 20 * (attempt + 1))
+            log(f"  Polygon 429{(' '+label) if label else ''} (attempt {attempt+1}/6), backing off {wait}s")
             time.sleep(wait)
             continue
         if r.status_code != 200:
@@ -494,6 +497,7 @@ def _polygon_get(url, timeout=15, label=""):
         except Exception as e:
             log(f"  Polygon JSON decode failed{(' '+label) if label else ''}: {e}")
             return None
+    log(f"  Polygon gave up after 6× 429{(' '+label) if label else ''} — quota likely starved by other client")
     return None
 
 def polygon_bars(ticker, days=100):
