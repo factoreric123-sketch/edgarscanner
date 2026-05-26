@@ -2,9 +2,9 @@ name: Heartbeat
 
 on:
   schedule:
-    - cron: '0 14 * * 1-5'   # 10:00 AM ET (market open check)
+    - cron: '0 14 * * 1-5'   # 10:00 AM ET
     - cron: '0 18 * * 1-5'   # 2:00 PM ET
-    - cron: '0 22 * * 1-5'   # 6:00 PM ET (after close)
+    - cron: '0 22 * * 1-5'   # 6:00 PM ET
   workflow_dispatch:
 
 jobs:
@@ -43,8 +43,8 @@ jobs:
         uses: actions/cache@v4
         with:
           path: bot_v15_state.json
-          key: insideredge-state-${{ github.run_id }}
-          restore-keys: insideredge-state-
+          key: insideredge-state-v1
+          restore-keys: insideredge-state-v1
       - name: Send heartbeat
         if: steps.secrets.outputs.ready == 'true'
         env:
@@ -56,3 +56,9 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
         run: python bot_v17.py --mode heartbeat
+      - name: Save state
+        if: always() && steps.secrets.outputs.ready == 'true'
+        uses: actions/cache@v4
+        with:
+          path: bot_v15_state.json
+          key: insideredge-state-v1

@@ -16,6 +16,11 @@ All v14 changes carried forward:
 
 v15 fix:
 - Added `timezone` to datetime imports (fixes: datetime.datetime has no attribute 'timezone')
+
+v17 fixes:
+- State cache key changed to fixed key (insideredge-state-v1) so runs always restore latest state
+- Price N/A fixed: reuse cached polygon_bars result instead of separate Polygon call
+- NXDT/pending re-queue fixed: seen_accessions and pending_trades now survive across runs
 """
 
 import requests, json, os, time, re
@@ -26,9 +31,6 @@ from zoneinfo import ZoneInfo
 
 # ── CREDENTIALS ───────────────────────────────────────────────────────────────
 
-# Credentials — read from environment variables (GitHub Secrets) with hardcoded fallback
-# In GitHub Actions: set these as repo secrets
-# Locally / PythonAnywhere: can still hardcode below or use .env
 import os as _os
 POLYGON_KEY   = _os.getenv("POLYGON_KEY")
 POLYGON_BASE  = "https://api.polygon.io"
@@ -43,26 +45,24 @@ SUPABASE_SERVICE_ROLE_KEY = _os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 # ── V15 CONFIG ────────────────────────────────────────────────────────────────
 
 MAX_HOLD_DAYS             = 15
-SOLO_MIN_SCORE            = 56     # v14: floor 56=67.6% WR n=102 hk=29.2%
+SOLO_MIN_SCORE            = 56
 CLUSTER_MIN_SCORE         = 36
 R3M_SKIP_ZONE_LO          = -0.30
-R3M_SKIP_ZONE_HI          = -0.20  # v14: narrowed — r3m -10 to -5 = 69% WR, freed
+R3M_SKIP_ZONE_HI          = -0.20
 SCORE_90_100_MAX_R3M      = 0.0
 HEALTHCARE_MIN_CLUSTER    = 3
 HEALTHCARE_SECTORS        = {"Healthcare","Biotechnology","Biopharmaceuticals","Pharmaceuticals"}
 SPY_WEAK_REGIME_THRESHOLD = -0.05
 HEALTH_FILTER_BYPASS_SCORE= 70
-MAX_CLUSTER_SIZE          = 5      # v16: cs=6 WR=45.5% (board grants) — cap at cs=5 WR=86.4%
+MAX_CLUSTER_SIZE          = 5
 MAX_INSIDER_BUYS_90D      = 3
-ATR_MIN_PCT               = 1.0    # v14: ATR<1% = 0 wins in 1346 trades
-EARNINGS_PROXIMITY_DAYS   = 5      # skip if filing within ±5 days of earnings
+ATR_MIN_PCT               = 1.0
+EARNINGS_PROXIMITY_DAYS   = 5
 
-# V15 regime constants
-SPY_MILD_STRESS_LO        = -0.03  # SPY r3m -3% to 0% = mild stress
+SPY_MILD_STRESS_LO        = -0.03
 SPY_MILD_STRESS_HI        =  0.00
-CLUSTER_STRESS_FLOOR      = 56     # raise cluster floor in mild stress
+CLUSTER_STRESS_FLOOR      = 56
 
-# Trail stop
 TRAIL_INITIAL    = 0.12
 TRAIL_TIER1_TRIG = 0.10
 TRAIL_TIER1_STOP = 0.09
@@ -160,7 +160,7 @@ def load_state():
         try:
             with open(STATE_FILE) as f: return json.load(f)
         except: pass
-    return {"positions": {}, "seen_accessions": [], "routine_history": {}}
+    return {"positions": {}, "seen_accessions": [], "routine_history": {}, "pending_trades": {}}
 
 def save_state(state):
     state["seen_accessions"] = state["seen_accessions"][-3000:]
@@ -209,7 +209,6 @@ def discord_signal(
     filter_reason, kelly,
     traded, existing_position=False, queued=False
 ):
-    # ── Status + color ────────────────────────────────────────
     if traded:
         emoji = "🚀"; color = 0x2ECC71
         status = "TRADE TAKEN"
@@ -226,7 +225,6 @@ def discord_signal(
         emoji = "⚠️"; color = 0xE67E22
         status = "SKIPPED"
 
-    # ── String formatting ─────────────────────────────────────
     cl_str   = f"Cluster  cs={cluster_size}" if cluster else "Solo"
     r3m_s    = f"{r3m*100:+.1f}%" if r3m is not None else "N/A"
     h52_s    = f"{h52:+.1f}%" if h52 is not None else "N/A"
@@ -243,7 +241,6 @@ def discord_signal(
     plan_s   = "⚠️ Yes (10b5-1)" if is_10b5 else "No"
     health_s = "✅ OK" if health_ok else "❌ Distressed"
 
-    # ── Score breakdown ───────────────────────────────────────
     comp_map = [
         ("ATR",      "pts_atr",     20),
         ("52wHigh",  "pts_52w",     20),
@@ -259,7 +256,6 @@ def discord_signal(
         score_lines.append(_score_bar(pts, max_v, label))
     score_block = "\n".join(score_lines)
 
-    # ── Reason ────────────────────────────────────────────────
     reason_map = {
         "ticker_blacklisted":     "🚫 **Blacklisted** — confirmed chronic loser across N≥5 trades",
         "see_remarks":            "❓ **SEE REMARKS** — unparseable filing, no actionable signal",
@@ -289,7 +285,6 @@ def discord_signal(
     else:
         reason_line = "⚠️ Unknown skip reason"
 
-    # ── Body ─────────────────────────────────────────────────
     SEP = "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     title_line = (f"**Title:** {title}\n"
                   if title and "SEE REMARKS" not in (title or "").upper() else "")
@@ -422,7 +417,6 @@ def place_order(ticker, notional):
     if not alpaca_enabled():
         log(f"  Trading disabled; skip order for {ticker}")
         return None
-    # Always use whole shares — works for fractional and non-fractional stocks
     price = get_price_alpaca(ticker) or get_price_polygon(ticker)
     if not price or price <= 0:
         log(f"  No price for {ticker}, order failed")
@@ -454,28 +448,14 @@ def close_position_alpaca(ticker):
 
 # ── POLYGON ───────────────────────────────────────────────────────────────────
 
-# Per-ticker bar cache + global throttle. Each ticker scan calls polygon_bars
-# 6× (3m return, ATR, monthly ATR, 52w high, 30d volume, current price). On
-# Polygon's 5-req/min free tier the last 1–2 calls were getting 429'd, which
-# the bare except silently swallowed and made price/volume show as N/A. The
-# cache collapses 6 calls into 1 per ticker; the throttle paces calls across
-# multiple tickers when several signals process in the same scan.
 _BARS_CACHE = {}  # ticker -> {"fetched_days": int, "bars": list}
 _LAST_POLYGON_FETCH = [0.0]
-# Free tier = 5 req/min → need ≥12s between calls. Default 25s assumes the
-# key is shared with one other bot (2.4 req/min each → ~4.8 combined, under
-# the 5/min cap). Solo on free: set 13. Paid: set 0.5 or lower.
 POLYGON_MIN_INTERVAL = float(_os.getenv("POLYGON_MIN_INTERVAL", "25"))
 
 def _polygon_get(url, timeout=15, label=""):
-    """Throttled GET against Polygon. Sleeps to honor POLYGON_MIN_INTERVAL,
-    retries on 429 with backoff, logs non-200. Returns parsed JSON dict or None."""
     elapsed = time.time() - _LAST_POLYGON_FETCH[0]
     if elapsed < POLYGON_MIN_INTERVAL:
         time.sleep(POLYGON_MIN_INTERVAL - elapsed)
-    # Retry budget: 6 attempts × ≤60s backoff = up to ~3min wait. With a second
-    # bot sharing the key, the 5/min window can be saturated for stretches —
-    # we'd rather block this signal briefly than mark it NO_MARKET_DATA.
     for attempt in range(6):
         try:
             r = requests.get(url, timeout=timeout)
@@ -551,7 +531,6 @@ def get_price_polygon(ticker):
     return bars[-1]["c"] if bars else 0
 
 def get_avg_30d_volume_dollars(ticker):
-    """Average daily dollar volume over last 30 trading days."""
     bars = polygon_bars(ticker, days=50)
     if not bars: return None
     recent = bars[-30:]
@@ -559,7 +538,6 @@ def get_avg_30d_volume_dollars(ticker):
     return sum(vols) / len(vols) if vols else None
 
 def get_monthly_atr_pct(ticker):
-    """21-day ATR as % of price (monthly rhythm, vs 14-day daily ATR)."""
     bars = polygon_bars(ticker, days=70)
     if len(bars) < 22: return None
     bars = bars[-22:]
@@ -571,17 +549,20 @@ def get_monthly_atr_pct(ticker):
     return (sum(trs) / len(trs)) / price * 100
 
 def get_current_price_and_change(ticker):
-    """Current price + 1-day change % for display."""
-    bars = polygon_bars(ticker, days=5)
-    if len(bars) < 2: return None, None
-    cur = bars[-1]["c"]; prev = bars[-2]["c"]
+    """
+    FIX v17: Reuse cached polygon_bars instead of making a separate Polygon call.
+    Previously this caused extra API hits per ticker, triggering 429s and Price: N/A.
+    All downstream callers already hold bars from polygon_bars() in cache — zero extra calls.
+    """
+    bars = _BARS_CACHE.get(ticker, {}).get("bars") or polygon_bars(ticker, days=5)
+    if len(bars) < 2:
+        return None, None
+    cur = bars[-1]["c"]
+    prev = bars[-2]["c"]
     chg = (cur - prev) / prev * 100 if prev else 0
     return cur, chg
 
-# ── FMP REMOVED — v15 runs without FMP ───────────────────────────────────────
-
-# Sector and financial health checks removed. health_ok=True always.
-# healthcare_low_cluster and health_fail filters are disabled as a result.
+# ── FMP REMOVED ───────────────────────────────────────────────────────────────
 
 def get_sector(ticker):          return "N/A"
 def get_financial_health(ticker): return True, "fmp_removed"
@@ -615,24 +596,11 @@ def _fetch_cached_transactions(accessions):
         return {}
     try:
         select_cols = ",".join([
-            "accession",
-            "filed_at",
-            "ticker",
-            "issuer_name",
-            "cik",
-            "reporting_owner_name",
-            "reporting_owner_title",
-            "is_director",
-            "is_officer",
-            "is_ten_percent_owner",
-            "transaction_code",
-            "is_10b5",
-            "shares",
-            "price_per_share",
-            "transaction_value",
-            "sec_updated_at",
-            "filing_href",
-            "filing_filename",
+            "accession","filed_at","ticker","issuer_name","cik",
+            "reporting_owner_name","reporting_owner_title",
+            "is_director","is_officer","is_ten_percent_owner",
+            "transaction_code","is_10b5","shares","price_per_share",
+            "transaction_value","sec_updated_at","filing_href","filing_filename",
         ])
         params = {
             "select": select_cols,
@@ -820,7 +788,6 @@ def _parse_sec_updated_at(value):
         return None
 
 def fetch_form4_filings(state, hours_back=20):
-    """Fetch recent Form 4 filings directly from free SEC EDGAR indexes."""
     last = state.get("last_scan_time")
     if last:
         try:
@@ -880,7 +847,6 @@ def fetch_form4_filings(state, hours_back=20):
     return all_filings
 
 def parse_filing_transactions(filing):
-    """Parse EDGAR Form 4 XML into the compact transaction shape used by the bot."""
     cached_transactions = filing.get("cached_transactions")
     if cached_transactions is not None:
         return [dict(txn) for txn in cached_transactions]
@@ -965,7 +931,6 @@ def parse_filing_transactions(filing):
     }]
 
 def run_smoke_test(state):
-    """Low-call integration test for SEC, Polygon, Discord, and Supabase."""
     unique_entries = []
     seen_accessions = set()
     for start in (0, 20, 40, 60):
@@ -1019,7 +984,6 @@ def run_smoke_test(state):
 # ── V15 SCORING ───────────────────────────────────────────────────────────────
 
 def get_days_to_earnings(ticker, as_of_date_str):
-    """Returns days between filing date and nearest earnings date (negative = earnings already passed)."""
     try:
         as_of = datetime.strptime(as_of_date_str[:10], "%Y-%m-%d")
         from_dt = (as_of - timedelta(days=30)).strftime("%Y-%m-%d")
@@ -1148,7 +1112,7 @@ def score_signal(value, atr_pct, pct_from_52w_high, r3m, spy_r3m, cluster, clust
 
 def kelly_size(score, cluster, cluster_size):
     if cluster:
-        if cluster_size >= 4:  return 0.33   # halfKelly=33.4%, WR=75%, n=83
+        if cluster_size >= 4:  return 0.33
         if cluster_size == 3:
             return 0.24 if score >= 60 else 0.0
         if cluster_size == 2:
@@ -1182,7 +1146,6 @@ def apply_filters(ticker, title, is_10b5, cluster, cluster_size, score,
         return "cluster_too_large"
     if routine:
         return "routine_buyer"
-    # V15 dynamic regime
     _spy = spy_r3m if spy_r3m is not None else 0
     _in_mild_stress = (SPY_MILD_STRESS_LO <= _spy < SPY_MILD_STRESS_HI)
     _cluster_floor = _score_floor(cluster, spy_r3m)
@@ -1192,11 +1155,8 @@ def apply_filters(ticker, title, is_10b5, cluster, cluster_size, score,
         return "score_too_low_stress" if _in_mild_stress else "score_too_low"
     if r3m is not None and R3M_SKIP_ZONE_LO < r3m <= R3M_SKIP_ZONE_HI:
         return "r3m_dead_zone"
-    # cluster_hot_stock REMOVED — hot clusters WR=85% after blacklist
-    # deep_mid_solo REMOVED — floor 56 handles weak signals
     if 90 <= score < 100 and r3m is not None and r3m >= SCORE_90_100_MAX_R3M:
         return "score_90_100_hot"
-    # healthcare_low_cluster and health_fail removed — FMP removed in v15
     if not cluster and spy_r3m is not None and spy_r3m < SPY_WEAK_REGIME_THRESHOLD:
         return "solo_weak_market"
     return None
@@ -1257,7 +1217,7 @@ def _exit(state, ticker, reason):
     del state["positions"][ticker]
     save_state(state)
 
-MAX_TOTAL_EXPOSURE = 0.85   # v16: cap total deployed at 85% of equity
+MAX_TOTAL_EXPOSURE = 0.85
 
 def get_deployed_pct(state, equity):
     if equity <= 0: return 0.0
@@ -1271,7 +1231,6 @@ def enter_position(state, ticker, score, score_comp, cluster, cluster_size,
     equity   = get_equity()
     k        = kelly_size(score, cluster, cluster_size)
 
-    # v16: exposure cap — never exceed 85% of equity across all positions
     deployed = get_deployed_pct(state, equity)
     remaining = MAX_TOTAL_EXPOSURE - deployed
     if remaining <= 0:
@@ -1316,12 +1275,9 @@ def enter_position(state, ticker, score, score_comp, cluster, cluster_size,
         None, k, traded=True
     )
 
-# ── SCAN FILINGS — runs anytime, market open or closed ────────────────────────
-# Evaluates every new filing. Filtered signals are discarded.
-# Passing signals go into state["pending_trades"] — executed when market opens.
+# ── SCAN FILINGS ──────────────────────────────────────────────────────────────
 
 def scan_filings(state):
-    # Use 72h lookback on Mondays to catch all weekend filings
     now_utc = datetime.utcnow()
     hours_back = 72 if now_utc.weekday() == 0 else 20
     filings = fetch_form4_filings(state, hours_back=hours_back)
@@ -1333,7 +1289,7 @@ def scan_filings(state):
     skipped_sells  = 0
     skipped_small  = 0
     skipped_seen   = 0
-    seen_acc_name  = set()  # v16: dedup (accession+name) to fix NKE double-count bug
+    seen_acc_name  = set()
 
     for filing in filings:
         acc = filing.get("accessionNo", "")
@@ -1388,6 +1344,7 @@ def scan_filings(state):
         atr_monthly = get_monthly_atr_pct(ticker)
         h52         = get_pct_from_52w_high(ticker)
         avg_vol_30d = get_avg_30d_volume_dollars(ticker)
+        # FIX v17: read price from already-cached bars — zero extra Polygon calls
         cur_px, chg = get_current_price_and_change(ticker)
         sector       = get_sector(ticker)
         health_ok, _ = get_financial_health(ticker)
@@ -1509,7 +1466,7 @@ def scan_filings(state):
 
     save_state(state)
 
-# ── EXECUTE PENDING — runs only when market is open ───────────────────────────
+# ── EXECUTE PENDING ───────────────────────────────────────────────────────────
 
 def execute_pending(state):
     if not trading_enabled():
@@ -1550,7 +1507,7 @@ def execute_pending(state):
             sig["is_10b5"],
             sig["routine"],
             sig["avg_vol_30d"],
-            None, None,   # current_price and chg fetched fresh inside enter_position
+            None, None,
             sig["health_ok"],
         )
         del pending[ticker]
@@ -1602,19 +1559,11 @@ def post_daily_summary(state, daily_trades):
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 
 def run_cycle(mode="scan"):
-    """
-    Single cycle — designed for GitHub Actions.
-    Mode:
-      scan      = full cycle (scan filings + execute pending + check positions)
-      premarket = scan + queue signals only (no execution — market not open yet)
-      heartbeat = post heartbeat to Discord only
-      summary   = post daily summary
-    """
     import sys
     state = load_state()
     try:
         log("=" * 55)
-        log(f"InsiderEdge v16 — {mode.upper()} cycle")
+        log(f"InsiderEdge v17 — {mode.upper()} cycle")
         log("=" * 55)
 
         equity = get_equity()
@@ -1653,7 +1602,6 @@ def run_cycle(mode="scan"):
             post_daily_summary(state, [])
             return
 
-        # scan + premarket: always scan for new filings
         scan_filings(state)
 
         if not trading_enabled():
@@ -1663,13 +1611,10 @@ def run_cycle(mode="scan"):
             market_open = is_market_open()
 
         if mode == "scan" and market_open and trading_enabled():
-            # Execute anything queued
             execute_pending(state)
-            # Check existing positions for exits
             if state["positions"]:
                 check_positions(state)
         elif mode == "premarket":
-            # Queue signals but don't execute yet
             queued = list(state.get("pending_trades", {}).keys())
             if queued:
                 log(f"Pre-market: {len(queued)} trade(s) ready for 9:30 open: {queued}")
@@ -1681,7 +1626,6 @@ def run_cycle(mode="scan"):
             queued = list(state.get("pending_trades", {}).keys())
             log(f"Market closed — {len(queued)} queued" if queued else "Market closed — nothing queued")
 
-        # 4:30 PM summary
         if now.hour == 16 and now.minute >= 30:
             post_daily_summary(state, [])
 

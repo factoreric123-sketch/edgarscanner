@@ -1,7 +1,4 @@
 # ── Pre-Market Scans ──────────────────────────────────────────────────────────
-# Scan 1: 8:30 AM ET = 12:30 UTC — resume after 11PM silence, catch overnight
-# Scan 2: 9:15 AM ET = 13:15 UTC — final queue check, posts to Discord before open
-# In EST winter: 7:30 AM and 8:15 AM — still useful, catches early filers
 name: Pre-Market
 
 on:
@@ -47,8 +44,8 @@ jobs:
         uses: actions/cache@v4
         with:
           path: bot_v15_state.json
-          key: insideredge-state-${{ github.run_id }}
-          restore-keys: insideredge-state-
+          key: insideredge-state-v1
+          restore-keys: insideredge-state-v1
       - name: Run pre-market scan
         if: steps.secrets.outputs.ready == 'true'
         env:
@@ -65,4 +62,4 @@ jobs:
         uses: actions/cache@v4
         with:
           path: bot_v15_state.json
-          key: insideredge-state-${{ github.run_id }}
+          key: insideredge-state-v1

@@ -1,10 +1,4 @@
 # ── Market Hours Scanner ──────────────────────────────────────────────────────
-# Every 5 min, 9:30AM-4:00PM ET (Mon-Fri)
-# Single UTC schedule — bot calls is_market_open() and handles DST correctly
-# 9:30AM ET = 13:30 UTC (EDT) / 14:30 UTC (EST)
-# 4:00PM ET = 20:00 UTC (EDT) / 21:00 UTC (EST)
-# We cover 13:30-19:55 UTC — catches EDT window perfectly
-# In EST (winter), market opens at 14:30 so bot exits early from 13:30-14:25 scans
 name: Market Scan
 
 on:
@@ -55,8 +49,8 @@ jobs:
         uses: actions/cache@v4
         with:
           path: bot_v15_state.json
-          key: insideredge-state-${{ github.run_id }}
-          restore-keys: insideredge-state-
+          key: insideredge-state-v1
+          restore-keys: insideredge-state-v1
       - name: Run scan
         if: steps.secrets.outputs.ready == 'true'
         env:
@@ -73,4 +67,4 @@ jobs:
         uses: actions/cache@v4
         with:
           path: bot_v15_state.json
-          key: insideredge-state-${{ github.run_id }}
+          key: insideredge-state-v1

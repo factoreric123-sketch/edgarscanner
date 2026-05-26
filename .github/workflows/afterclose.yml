@@ -1,16 +1,4 @@
 # ── After-Close & Evening Scans ───────────────────────────────────────────────
-# 45% of daily Form 4 volume files between 4-6:30 PM ET
-# Single UTC schedule — shifts 1hr in winter but coverage maintained
-#
-# EDT (summer) → EST (winter):
-#   20:15 UTC = 4:15 PM EDT → 3:15 PM EST (market hours, market scan covers it)
-#   20:30 UTC = 4:30 PM EDT → 3:30 PM EST (market hours, market scan covers it)
-#   21:00 UTC = 5:00 PM EDT → 4:00 PM EST (right at close ✅)
-#   22:00 UTC = 6:00 PM EDT → 5:00 PM EST ✅
-#   00:00 UTC = 8:00 PM EDT → 7:00 PM EST ✅  (pre-bed check)
-#   02:00 UTC = 10:00 PM EDT → 9:00 PM EST ✅ (bedtime scan)
-#
-# Silent window: 02:00-12:30 UTC (10PM-8:30AM EDT) — almost zero filing activity
 name: After-Close and Evening
 
 on:
@@ -19,8 +7,8 @@ on:
     - cron: '30 20 * * 1-5'   # 4:30 PM EDT / 3:30 PM EST
     - cron: '0  21 * * 1-5'   # 5:00 PM EDT / 4:00 PM EST
     - cron: '0  22 * * 1-5'   # 6:00 PM EDT / 5:00 PM EST
-    - cron: '0  0  * * 2-6'   # 8:00 PM EDT / 7:00 PM EST  (next UTC day)
-    - cron: '0  2  * * 2-6'   # 10:00 PM EDT / 9:00 PM EST (next UTC day)
+    - cron: '0  0  * * 2-6'   # 8:00 PM EDT / 7:00 PM EST
+    - cron: '0  2  * * 2-6'   # 10:00 PM EDT / 9:00 PM EST
   workflow_dispatch:
 
 jobs:
@@ -60,8 +48,8 @@ jobs:
         uses: actions/cache@v4
         with:
           path: bot_v15_state.json
-          key: insideredge-state-${{ github.run_id }}
-          restore-keys: insideredge-state-
+          key: insideredge-state-v1
+          restore-keys: insideredge-state-v1
       - name: Run evening scan
         if: steps.secrets.outputs.ready == 'true'
         env:
@@ -78,4 +66,4 @@ jobs:
         uses: actions/cache@v4
         with:
           path: bot_v15_state.json
-          key: insideredge-state-${{ github.run_id }}
+          key: insideredge-state-v1
