@@ -1805,5 +1805,33 @@ def main():
             mode = sys.argv[i+1]
     run_cycle(mode)
 
+def _alert_crash_and_reraise(mode, exc):
+    """Post a one-line crash card to Discord so a Python-level failure is
+    visible without digging through Actions logs. Re-raises so the workflow
+    step still fails (and the workflow-level alert step fires too)."""
+    import traceback
+    tb = traceback.format_exc()
+    # Discord embed body cap is 4096; keep room for headers.
+    body_tb = tb[-3500:] if len(tb) > 3500 else tb
+    try:
+        discord_send(
+            f"🚨 BOT CRASH | mode={mode}",
+            f"**{type(exc).__name__}**: {str(exc)[:300]}\n```\n{body_tb}\n```",
+            0xE74C3C,
+        )
+    except Exception:
+        pass  # don't mask the original crash if Discord itself is the problem
+    raise exc
+
 if __name__ == "__main__":
-    main()
+    import sys
+    _mode = "scan"
+    for _i, _arg in enumerate(sys.argv[1:], 1):
+        if _arg == "--mode" and _i < len(sys.argv):
+            _mode = sys.argv[_i+1]
+    try:
+        main()
+    except SystemExit:
+        raise
+    except BaseException as _e:
+        _alert_crash_and_reraise(_mode, _e)
