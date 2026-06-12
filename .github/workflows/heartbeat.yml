@@ -40,11 +40,12 @@ jobs:
         run: pip install requests
       - name: Restore state
         if: steps.secrets.outputs.ready == 'true'
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: bot_v15_state.json
-          key: insideredge-state-v1
-          restore-keys: insideredge-state-v1
+          key: insideredge-state-${{ github.run_id }}
+          restore-keys: |
+            insideredge-state-
       - name: Send heartbeat
         if: steps.secrets.outputs.ready == 'true'
         env:
@@ -58,7 +59,7 @@ jobs:
         run: python bot_v17.py --mode heartbeat
       - name: Save state
         if: always() && steps.secrets.outputs.ready == 'true'
-        uses: actions/cache@v4
+        uses: actions/cache/save@v4
         with:
           path: bot_v15_state.json
-          key: insideredge-state-v1
+          key: insideredge-state-${{ github.run_id }}
