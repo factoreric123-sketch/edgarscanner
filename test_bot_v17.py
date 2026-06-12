@@ -157,8 +157,25 @@ class BotSignalPolicyTests(unittest.TestCase):
         self.assertEqual(comp["pts_pre5"], 0)
         self.assertEqual(score, 52)
 
-    def test_pre5_still_rewards_signal_that_already_clears_floor(self):
+    def test_pre5_still_rewards_cluster_that_already_clears_floor(self):
+        # v18 P1: pre5 bonus is cluster-only. A cluster clearing its floor still
+        # earns +5; the solo equivalent now earns 0 (see assertion below).
         score, comp = bot_v17.score_signal(
+            value=500_000,
+            atr_pct=12.5,
+            pct_from_52w_high=-60.0,
+            r3m=-0.35,
+            spy_r3m=0.02,
+            cluster=True,
+            cluster_size=2,
+            pre5_return=0.01,
+        )
+
+        self.assertEqual(comp["pts_pre5"], 5)
+        self.assertEqual(score, 89)
+
+        # Same inputs as a solo: no pre5 bonus under v18 (was the GMEX/NOMA leak).
+        _, solo_comp = bot_v17.score_signal(
             value=500_000,
             atr_pct=12.5,
             pct_from_52w_high=-60.0,
@@ -168,9 +185,7 @@ class BotSignalPolicyTests(unittest.TestCase):
             cluster_size=1,
             pre5_return=0.01,
         )
-
-        self.assertEqual(comp["pts_pre5"], 5)
-        self.assertEqual(score, 73)
+        self.assertEqual(solo_comp["pts_pre5"], 0)
 
     def test_apply_filters_blocks_extreme_52w_decline(self):
         reason = bot_v17.apply_filters(

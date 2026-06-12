@@ -41,6 +41,7 @@ DISCORD_URL   = _os.getenv("DISCORD_URL")
 SEC_USER_AGENT = _os.getenv("SEC_USER_AGENT") or "InsiderEdge/1.0 (contact: support@example.com)"
 SUPABASE_URL  = (_os.getenv("SUPABASE_URL") or "").rstrip("/")
 SUPABASE_SERVICE_ROLE_KEY = _os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+EODHD_KEY     = _os.getenv("EODHD_KEY")   # earnings calendar (free tier) — makes stale_cluster + earnings_proximity live on free Polygon
 
 # ── V15 CONFIG ────────────────────────────────────────────────────────────────
 
@@ -58,6 +59,10 @@ MAX_CLUSTER_SIZE          = 5
 MAX_INSIDER_BUYS_90D      = 3
 ATR_MIN_PCT               = 1.0
 EARNINGS_PROXIMITY_DAYS   = 5
+STALE_CLUSTER_DAYS        = 45     # v18 P2: clusters >45d after earnings = 33.3% WR
+MAX_QUEUE_AGE_DAYS        = 4      # v18 P4: drop queued signals older than 4 calendar days
+CLUSTER_LOOKBACK_DAYS     = 7      # v18 P7: Supabase cluster accumulation window
+MIN_EXPOSURE_FOR_ENTRY    = 0.05   # v18 P9: skip entries when <5% exposure headroom remains
 
 SPY_MILD_STRESS_LO        = -0.03
 SPY_MILD_STRESS_HI        =  0.00
@@ -263,6 +268,7 @@ def discord_signal(
         "52w_too_far":            f"💀 **Near zero** — 52w high Δ {h52_s} <= -95% (distressed/delisted risk)",
         "institutional_buyer":    f"🏦 **Institutional/HFT filer** — {insider_name or 'This filer'} is not treated as a conviction insider buy",
         "earnings_proximity":     f"📅 **Earnings too close** — filing within ±5 days of earnings (noise, not conviction)",
+        "stale_cluster":          f"🕸️ **Stale cluster** — last earnings >{STALE_CLUSTER_DAYS}d ago (mid-quarter dead zone, WR=33.3% / -2.85% in dataset)",
         "private_placement":       "🏦 **Private placement** — value > 60× daily vol (not open market buy)",
         "10b5_plan":              "📋 **10b5-1 plan** — pre-scheduled, zero informational content",
         "cluster_too_large":      f"👥 **Cluster too large** — cs={cluster_size} > 5 (board grant pattern, WR=45.5%)",
@@ -324,7 +330,7 @@ def discord_exit(ticker, ret_pct, reason, hold_days, entry_px, exit_px, score, k
     emoji = "✅" if ret_pct > 0 else "❌"
     exit_labels = {
         "trail_stop": "🛑 Trail stop triggered",
-        "hold_14d":   "⏰ 14-day max hold expired",
+        "hold_14d":   "⏰ 15-day max hold expired",
         "hold_30d":   "⏰ Hold period complete",
     }
     lines = [
@@ -669,6 +675,33 @@ def _upsert_transactions_to_supabase(filing, txns):
     except Exception as e:
         log(f"Supabase upsert error: {e}")
 
+def supabase_cluster_size(ticker, filed_date):
+    """v18 P7: count distinct insider buyers for this ticker across the last
+    CLUSTER_LOOKBACK_DAYS of stored filings. Filings arriving on different scan
+    cycles/days otherwise undercount clusters (SRAD showed cs=5 vs real cs=7)."""
+    if not supabase_enabled():
+        return None, None
+    try:
+        since = (datetime.strptime(filed_date[:10], "%Y-%m-%d")
+                 - timedelta(days=CLUSTER_LOOKBACK_DAYS)).strftime("%Y-%m-%d")
+        r = requests.get(
+            f"{SUPABASE_URL}/rest/v1/insider_form4_filings",
+            headers=supabase_headers(),
+            params={"select": "reporting_owner_name,transaction_value",
+                    "ticker": f"eq.{ticker}", "filed_at": f"gte.{since}",
+                    "transaction_code": "eq.P"},
+            timeout=15)
+        if r.status_code != 200:
+            return None, None
+        rows = r.json()
+        names = {_normalize_owner_name(x.get("reporting_owner_name"))
+                 for x in rows if x.get("reporting_owner_name")}
+        val = sum(sf(x.get("transaction_value")) for x in rows)
+        return (len(names) or None), (val or None)
+    except Exception as e:
+        log(f"Supabase cluster error: {e}")
+        return None, None
+
 def _fetch_current_form4_entries(start=0, count=100):
     url = (
         "https://www.sec.gov/cgi-bin/browse-edgar"
@@ -983,10 +1016,40 @@ def run_smoke_test(state):
 
 # ── V15 SCORING ───────────────────────────────────────────────────────────────
 
-def get_days_to_earnings(ticker, as_of_date_str):
+def get_days_to_earnings_eodhd(ticker, as_of_date_str):
+    """v18 P11: EODHD earnings calendar — free tier includes it, unlike Polygon's
+    paywalled vX/reference/financials. Without this, days_to_earnings is None on
+    every call and both earnings_proximity AND stale_cluster are silent no-ops."""
+    if not EODHD_KEY:
+        return None
     try:
         as_of = datetime.strptime(as_of_date_str[:10], "%Y-%m-%d")
-        from_dt = (as_of - timedelta(days=30)).strftime("%Y-%m-%d")
+        frm = (as_of - timedelta(days=90)).strftime("%Y-%m-%d")
+        to  = (as_of + timedelta(days=30)).strftime("%Y-%m-%d")
+        r = requests.get("https://eodhd.com/api/calendar/earnings",
+            params={"api_token": EODHD_KEY, "symbols": f"{ticker}.US",
+                    "from": frm, "to": to, "fmt": "json"}, timeout=10)
+        if r.status_code != 200:
+            return None
+        earnings = (r.json() or {}).get("earnings", [])
+        if not earnings:
+            return None
+        closest = min(earnings, key=lambda e: abs(
+            (datetime.strptime(e["report_date"][:10], "%Y-%m-%d") - as_of).days))
+        return (datetime.strptime(closest["report_date"][:10], "%Y-%m-%d") - as_of).days
+    except Exception:
+        return None
+
+def get_days_to_earnings(ticker, as_of_date_str):
+    """Returns days between filing date and nearest earnings date (negative = earnings already passed).
+    EODHD primary (works on free tier); Polygon vX/financials fallback for paid plans."""
+    via_eodhd = get_days_to_earnings_eodhd(ticker, as_of_date_str)
+    if via_eodhd is not None:
+        return via_eodhd
+    try:
+        as_of = datetime.strptime(as_of_date_str[:10], "%Y-%m-%d")
+        # v18 P2: 90d lookback so stale clusters (last earnings >45d ago) are visible.
+        from_dt = (as_of - timedelta(days=90)).strftime("%Y-%m-%d")
         to_dt   = (as_of + timedelta(days=30)).strftime("%Y-%m-%d")
         url = (f"{POLYGON_BASE}/vX/reference/financials"
                f"?ticker={ticker}&filing_date.gte={from_dt}&filing_date.lte={to_dt}"
@@ -1104,7 +1167,10 @@ def score_signal(value, atr_pct, pct_from_52w_high, r3m, spy_r3m, cluster, clust
 
     base_score = min(sum(comp.values()), 100)
     score_floor = _score_floor(cluster, spy_r3m)
-    comp["pts_pre5"] = 5 if pre5_return is not None and pre5_return >= 0 and base_score >= score_floor else 0
+    # v18 P1: pre5 bonus is cluster-only. Pooled effect (81.1% vs 66.4%) is entirely
+    # clusters; solo effect is zero (68.4 vs 68.2) and the +5 only pushed weak solos
+    # over the 56 floor (the GMEX/NOMA failure mode).
+    comp["pts_pre5"] = 5 if cluster and pre5_return is not None and pre5_return >= 0 and base_score >= score_floor else 0
 
     return min(base_score + comp["pts_pre5"], 100), comp
 
@@ -1134,6 +1200,10 @@ def apply_filters(ticker, title, is_10b5, cluster, cluster_size, score,
         return "institutional_buyer"
     if days_to_earnings is not None and abs(days_to_earnings) <= EARNINGS_PROXIMITY_DAYS:
         return "earnings_proximity"
+    # v18 P2: stale cluster — formed in the mid-quarter info dead zone (last earnings
+    # >45d ago, no imminent catalyst). 33.3% WR / -2.85% in dataset. Solos exempt.
+    if cluster and days_to_earnings is not None and days_to_earnings < -STALE_CLUSTER_DAYS:
+        return "stale_cluster"
     if "SEE REMARKS" in (title or "").upper():
         return "see_remarks"
     if atr_pct is not None and atr_pct < ATR_MIN_PCT:
@@ -1155,7 +1225,8 @@ def apply_filters(ticker, title, is_10b5, cluster, cluster_size, score,
         return "score_too_low_stress" if _in_mild_stress else "score_too_low"
     if r3m is not None and R3M_SKIP_ZONE_LO < r3m <= R3M_SKIP_ZONE_HI:
         return "r3m_dead_zone"
-    if 90 <= score < 100 and r3m is not None and r3m >= SCORE_90_100_MAX_R3M:
+    # v18 P5: was `90 <= score < 100` — score==100 was escaping the hot-stock trap.
+    if score >= 90 and r3m is not None and r3m >= SCORE_90_100_MAX_R3M:
         return "score_90_100_hot"
     if not cluster and spy_r3m is not None and spy_r3m < SPY_WEAK_REGIME_THRESHOLD:
         return "solo_weak_market"
@@ -1170,8 +1241,14 @@ def is_routine_buyer(state, name, ticker, today):
     return len([d for d in hist if d >= cutoff]) >= MAX_INSIDER_BUYS_90D
 
 def record_buy(state, name, ticker, today):
+    # v18 P8: prune to 90d while appending so routine_history stays bounded and the
+    # ">3x in 90d" check is accurate. Recorded for every filing (see scan_filings),
+    # not just taken trades — the old taken-only recording made this filter ~dead.
     key = f"{name}_{ticker}"
-    state.setdefault("routine_history", {}).setdefault(key, []).append(today)
+    hist = state.setdefault("routine_history", {}).setdefault(key, [])
+    cutoff = (datetime.strptime(today[:10], "%Y-%m-%d") - timedelta(days=90)).strftime("%Y-%m-%d")
+    hist[:] = [d for d in hist if d >= cutoff]
+    hist.append(today[:10])
 
 # ── TRAILING STOP ─────────────────────────────────────────────────────────────
 
@@ -1208,6 +1285,11 @@ def _exit(state, ticker, reason):
     pos = state["positions"].get(ticker)
     if not pos: return
     price    = get_price_alpaca(ticker) or get_price_polygon(ticker)
+    # v18 P6: never close/report on a missing price — defer the exit to a later cycle
+    # rather than book a bogus 0% / wrong-price exit.
+    if not price or price <= 0:
+        log(f"  {ticker}: no price available, skipping exit this cycle")
+        return
     entry_px = sf(pos["entry_price"])
     hold_d   = (datetime.now() - datetime.strptime(pos["entry_date"], "%Y-%m-%d")).days
     ret_pct  = (price - entry_px) / entry_px * 100 if entry_px and price else 0
@@ -1227,7 +1309,7 @@ def get_deployed_pct(state, equity):
 def enter_position(state, ticker, score, score_comp, cluster, cluster_size,
                    r3m, atr_daily, atr_monthly, h52, value, spy_r3m, sector, name,
                    filed_date, insider_name, title, is_10b5, routine,
-                   avg_vol_30d, current_price, price_chg_1d, health_ok):
+                   avg_vol_30d, current_price, price_chg_1d, health_ok, insider_px=0):
     equity   = get_equity()
     k        = kelly_size(score, cluster, cluster_size)
 
@@ -1236,17 +1318,31 @@ def enter_position(state, ticker, score, score_comp, cluster, cluster_size,
     if remaining <= 0:
         log(f"  {ticker}: exposure cap reached ({deployed:.0%} deployed), skip")
         return
+    # v18 P9: don't open micro-positions in the last sliver of exposure headroom
+    if remaining < MIN_EXPOSURE_FOR_ENTRY:
+        log(f"  {ticker}: only {remaining:.0%} exposure left — skip (micro-position)")
+        return
     if k > remaining:
         log(f"  {ticker}: Kelly {k:.0%} → {remaining:.0%} (exposure cap, {deployed:.0%} deployed)")
         k = remaining
 
-    notional = equity * k
-    if notional < 1:
-        log(f"  Notional ${notional:.0f} too small, skip {ticker}")
-        return
     price = get_price_alpaca(ticker) or get_price_polygon(ticker)
     if not price or price <= 0:
         log(f"  No price for {ticker}, skip")
+        return
+
+    # v18 P3: drift Kelly modulation. Entering BELOW the insider's price wins
+    # (drift [-8,-1) = 77-84% WR); chasing above underperforms (~65%). Size up on
+    # a discount, down on a chase. Boost stays within remaining exposure.
+    if insider_px and price:
+        drift = (price - insider_px) / insider_px
+        if   drift <= -0.01: k = min(k * 1.15, remaining)
+        elif drift >=  0.01: k = k * 0.85
+        log(f"  {ticker}: drift {drift*100:+.1f}% vs insider ${insider_px:.2f} → kelly {k:.0%}")
+
+    notional = equity * k
+    if notional < 1:
+        log(f"  Notional ${notional:.0f} too small, skip {ticker}")
         return
     result = place_order(ticker, notional)
     if not result: return
@@ -1262,7 +1358,8 @@ def enter_position(state, ticker, score, score_comp, cluster, cluster_size,
         "cluster_size": cluster_size,
         "notional":     notional,
     }
-    record_buy(state, name, ticker, today)
+    # v18 P8: routine_history is now populated for every filing in scan_filings;
+    # recording again here would double-count the rep insider.
     save_state(state)
     discord_signal(
         ticker, filed_date, insider_name, title,
@@ -1334,10 +1431,25 @@ def scan_filings(state):
         cluster      = cluster_size > 1
         total_value  = sum(t["value"] for t in txns)
         rep          = max(txns, key=lambda t: t["value"])
+
+        # v18 P7: upgrade cluster size using filings accumulated across prior cycles
+        sb_cs, sb_val = supabase_cluster_size(ticker, filed_date)
+        if sb_cs and sb_cs > cluster_size:
+            log(f"  {ticker}: cluster {cluster_size}→{sb_cs} via {CLUSTER_LOOKBACK_DAYS}d accumulation")
+            cluster_size = sb_cs
+            cluster      = cluster_size > 1
+            total_value  = max(total_value, sb_val or 0)
         title        = rep["title"]
         is_10b5      = rep["is_10b5"]
         name         = rep["name"]
         routine      = is_routine_buyer(state, name, ticker, filed_date)
+        # v18 P8: record every (deduped) filing AFTER the routine check so today's
+        # filing is not counted in its own check — preserves v17 semantic (4th
+        # buy blocked, not 3rd) while fixing the "taken-trades-only" leak that
+        # made this filter effectively dead. Records every insider in the
+        # cluster, not just the rep, so future filings see full history.
+        for _t in txns:
+            record_buy(state, _t["name"], _t["ticker"], _t["filed_at"])
 
         r3m         = get_3m_return(ticker)
         atr_daily   = get_atr_pct(ticker)
@@ -1451,6 +1563,7 @@ def scan_filings(state):
                 "routine":      routine,
                 "avg_vol_30d":  avg_vol_30d,
                 "kelly":        k,
+                "insider_px":   rep.get("price_per_share") or 0,   # v18 P3: drift sizing at execution
                 "queued_at":    datetime.now().isoformat(),
             }
             log(f"    → Queued for open | score={score:.0f} | kelly={k:.0%}")
@@ -1478,6 +1591,20 @@ def execute_pending(state):
     log(f"Executing {len(pending)} pending trade(s)…")
     for ticker in list(pending.keys()):
         sig = pending[ticker]
+
+        # v18 P4: drop stale queued signals (the edge decays between filing and entry;
+        # a Fri→Mon weekend is 3 calendar days, a holiday Tuesday is 4).
+        queued_at = sig.get("queued_at")
+        if queued_at:
+            try:
+                age_d = (datetime.now() - datetime.fromisoformat(queued_at)).days
+            except Exception:
+                age_d = 0
+            if age_d > MAX_QUEUE_AGE_DAYS:
+                log(f"  {ticker}: queued {age_d}d ago — expired, dropping")
+                discord_send(f"🕸️ {ticker} | QUEUE EXPIRED",
+                    f"Queued {age_d} days ago — signal stale, not executing.", 0x95A5A6)
+                del pending[ticker]; save_state(state); continue
 
         if ticker in state["positions"]:
             log(f"  {ticker}: position already exists, dropping from queue")
@@ -1509,6 +1636,7 @@ def execute_pending(state):
             sig["avg_vol_30d"],
             None, None,
             sig["health_ok"],
+            sig.get("insider_px", 0),   # v18 P3: drift Kelly modulation
         )
         del pending[ticker]
         save_state(state)

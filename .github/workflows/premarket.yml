@@ -56,6 +56,7 @@ jobs:
           SEC_USER_AGENT: ${{ secrets.SEC_USER_AGENT }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          EODHD_KEY: ${{ secrets.EODHD_KEY }}
         run: python bot_v17.py --mode premarket
       - name: Save state
         if: always() && steps.secrets.outputs.ready == 'true'
