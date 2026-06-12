@@ -80,3 +80,18 @@ jobs:
         with:
           path: bot_v15_state.json
           key: insideredge-state-${{ github.run_id }}
+      - name: Alert on failure
+        if: failure() && steps.secrets.outputs.ready == 'true'
+        env:
+          DISCORD_URL: ${{ secrets.DISCORD_URL }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          WF_NAME: ${{ github.workflow }}
+          JOB_NAME: ${{ github.job }}
+        shell: bash
+        # Best-effort: don't fail the failure-handler itself (|| true).
+        run: |
+          payload=$(cat <<JSON
+          {"embeds":[{"title":"🚨 ${WF_NAME} failed","color":15158332,"description":"Job **${JOB_NAME}** did not complete.\n\n[Open run logs](${RUN_URL})","footer":{"text":"GitHub Actions"}}]}
+          JSON
+          )
+          curl -s -H "Content-Type: application/json" -X POST -d "$payload" "$DISCORD_URL" || true
