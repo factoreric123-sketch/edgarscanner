@@ -85,12 +85,33 @@ TICKER_BLACKLIST = {
     "LRMR","DMAC","NKTX",
 }
 
+# Substring match on _normalize_owner_name() output (uppercased, punctuation→space,
+# whitespace collapsed). Multi-word forms used where a single word could collide
+# with a person's name. Trailing space (e.g. "TPG ", "BVF ") prevents matching a
+# 4-letter prefix in unrelated tickers/names.
 INSTITUTIONAL_BUYER_KEYWORDS = (
-    "HRT FINANCIAL",
-    "CITADEL ADVISORS",
-    "RENAISSANCE TECHNOLOGIES",
-    "TWO SIGMA",
-    "VIRTU",
+    # quant / HFT / market makers
+    "HRT FINANCIAL", "CITADEL", "RENAISSANCE TECHNOLOGIES", "TWO SIGMA",
+    "VIRTU", "JANE STREET", "SUSQUEHANNA", "D E SHAW", "DE SHAW",
+    "MILLENNIUM MANAGEMENT", "POINT72", "JUMP TRADING", "TOWER RESEARCH",
+    # private equity
+    "GENERAL ATLANTIC", "APOLLO GLOBAL", "BLACKSTONE", "CARLYLE",
+    "TPG ", "WARBURG PINCUS", "BAIN CAPITAL", "SILVER LAKE",
+    "VISTA EQUITY", "THOMA BRAVO", "ADVENT INTERNATIONAL",
+    "INSIGHT PARTNERS", "HELLMAN", "SYCAMORE PARTNERS", "CYNOSURE",
+    # biotech crossover funds (frequent Form 4 filers in our small-cap universe)
+    "ORBIMED", "BAKER BROS", "RA CAPITAL", "PERCEPTIVE ADVISORS",
+    "DEERFIELD", "BVF ", "FAIRMOUNT", "VENROCK", "VIVO CAPITAL",
+    "RTW INVESTMENTS", "CORMORANT", "ECOR1", "BOXER CAPITAL",
+    "TANG CAPITAL", "FORESITE", "FRAZIER LIFE", "CASDIN",
+    "ALLY BRIDGE",
+    # activists / hedge funds
+    "ICAHN", "STARBOARD VALUE", "ELLIOTT INVESTMENT", "ELLIOTT MANAGEMENT",
+    "ANCORA", "ENGAGED CAPITAL", "JANA PARTNERS", "VALUEACT",
+    "THIRD POINT", "PERSHING SQUARE", "SACHEM HEAD",
+    # asset managers / banks (file as 10% owners)
+    "BLACKROCK", "VANGUARD", "STATE STREET", "FMR LLC", "FIDELITY MANAGEMENT",
+    "GOLDMAN SACHS", "MORGAN STANLEY", "JPMORGAN", "WELLINGTON MANAGEMENT",
 )
 
 # ── HELPERS ───────────────────────────────────────────────────────────────────
@@ -267,6 +288,7 @@ def discord_signal(
         "atr_too_low":            f"📉 **ATR too low** — {atr_d_s} < 1.0% (0 wins in 1,346-trade dataset)",
         "52w_too_far":            f"💀 **Near zero** — 52w high Δ {h52_s} <= -95% (distressed/delisted risk)",
         "institutional_buyer":    f"🏦 **Institutional/HFT filer** — {insider_name or 'This filer'} is not treated as a conviction insider buy",
+        "entity_10pct_owner":     "🏦 **10% owner entity** — filer is neither officer nor director (treated as fund, not insider)",
         "earnings_proximity":     f"📅 **Earnings too close** — filing within ±5 days of earnings (noise, not conviction)",
         "stale_cluster":          f"🕸️ **Stale cluster** — last earnings >{STALE_CLUSTER_DAYS}d ago (mid-quarter dead zone, WR=33.3% / -2.85% in dataset)",
         "private_placement":       "🏦 **Private placement** — value > 60× daily vol (not open market buy)",
@@ -1191,13 +1213,21 @@ def kelly_size(score, cluster, cluster_size):
 
 def apply_filters(ticker, title, is_10b5, cluster, cluster_size, score,
                   r3m, spy_r3m, routine, atr_pct, avg_vol_30d=None, value=0,
-                  h52=None, days_to_earnings=None, insider_name=None):
+                  h52=None, days_to_earnings=None, insider_name=None,
+                  is_ten_percent_owner=False, is_officer=False, is_director=False):
     if ticker in TICKER_BLACKLIST:
         return "ticker_blacklisted"
     if h52 is not None and h52 <= -95:
         return "52w_too_far"
     if insider_name and is_institutional_buyer(insider_name):
         return "institutional_buyer"
+    # Structural catch for entities the name-list misses: a 10% owner who is
+    # neither officer nor director is almost always a fund/holding-co, not a
+    # conviction insider. Untested vs the 1,346-trade dataset (no flag column),
+    # so it routes to FILTERED with its own reason — watch cards for founder
+    # whales without board seats.
+    if is_ten_percent_owner and not is_officer and not is_director:
+        return "entity_10pct_owner"
     if days_to_earnings is not None and abs(days_to_earnings) <= EARNINGS_PROXIMITY_DAYS:
         return "earnings_proximity"
     # v18 P2: stale cluster — formed in the mid-quarter info dead zone (last earnings
@@ -1508,7 +1538,10 @@ def scan_filings(state):
         reason = apply_filters(ticker, title, is_10b5, cluster, cluster_size, score,
                                r3m, spy_r3m, routine, atr_daily,
                                avg_vol_30d=avg_vol_30d, value=total_value, h52=h52,
-                               days_to_earnings=days_to_earnings, insider_name=name)
+                               days_to_earnings=days_to_earnings, insider_name=name,
+                               is_ten_percent_owner=rep.get("is_ten_percent_owner", False),
+                               is_officer=rep.get("is_officer", False),
+                               is_director=rep.get("is_director", False))
 
         cl_str  = f"CLUSTER cs={cluster_size}" if cluster else "solo"
         r3m_str = f"{r3m*100:+.0f}%" if r3m is not None else "N/A"
