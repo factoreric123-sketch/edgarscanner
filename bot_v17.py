@@ -1414,9 +1414,6 @@ def scan_filings(state):
             if dedup_key in seen_acc_name:
                 continue
             seen_acc_name.add(dedup_key)
-            # v18 P8: record every filing (deduped) before the routine check below
-            # runs, so a genuinely repeat insider is counted correctly.
-            record_buy(state, txn["name"], txn["ticker"], txn["filed_at"])
             key = (txn["ticker"], txn["filed_at"])
             by_ticker_date[key].append(txn)
 
@@ -1446,6 +1443,13 @@ def scan_filings(state):
         is_10b5      = rep["is_10b5"]
         name         = rep["name"]
         routine      = is_routine_buyer(state, name, ticker, filed_date)
+        # v18 P8: record every (deduped) filing AFTER the routine check so today's
+        # filing is not counted in its own check — preserves v17 semantic (4th
+        # buy blocked, not 3rd) while fixing the "taken-trades-only" leak that
+        # made this filter effectively dead. Records every insider in the
+        # cluster, not just the rep, so future filings see full history.
+        for _t in txns:
+            record_buy(state, _t["name"], _t["ticker"], _t["filed_at"])
 
         r3m         = get_3m_return(ticker)
         atr_daily   = get_atr_pct(ticker)
