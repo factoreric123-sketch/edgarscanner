@@ -11,6 +11,13 @@ on:
     - cron: '0  2  * * 2-6'   # 10:00 PM EDT / 9:00 PM EST
   workflow_dispatch:
 
+
+# All stateful workflows share one concurrency group: they mutate the same
+# cached state file, so runs must never overlap (a 14-min busy scan would
+# otherwise collide with the next 5-min cron tick).
+concurrency:
+  group: insideredge-state
+  cancel-in-progress: false
 jobs:
   evening-scan:
     runs-on: ubuntu-latest
