@@ -38,6 +38,7 @@ ALPACA_KEY    = _os.getenv("ALPACA_KEY")
 ALPACA_SECRET = _os.getenv("ALPACA_SECRET")
 ALPACA_BASE   = "https://paper-api.alpaca.markets"
 DISCORD_URL   = _os.getenv("DISCORD_URL")
+DISCORD_USER_ID = _os.getenv("DISCORD_USER_ID")  # numeric Discord user ID; pinged on queued/traded/exits so the @mentions-only channel notifies
 SEC_USER_AGENT = _os.getenv("SEC_USER_AGENT") or "InsiderEdge/1.0 (contact: support@example.com)"
 SUPABASE_URL  = (_os.getenv("SUPABASE_URL") or "").rstrip("/")
 SUPABASE_SERVICE_ROLE_KEY = _os.getenv("SUPABASE_SERVICE_ROLE_KEY")
@@ -195,14 +196,19 @@ def save_state(state):
 
 # ── DISCORD ───────────────────────────────────────────────────────────────────
 
-def discord_send(title, body, color=0x5865F2):
+def discord_send(title, body, color=0x5865F2, mention=False):
     if not DISCORD_URL:
         log("Discord webhook not configured; skipping Discord notification")
         return
+    payload = {"embeds": [{"title": title[:256], "description": body[:4096], "color": color}]}
+    if mention and DISCORD_USER_ID:
+        # Embeds don't ping; the user-id mention lives in the message content,
+        # and allowed_mentions whitelists just this user so we never accidentally
+        # @here / @everyone the channel.
+        payload["content"] = f"<@{DISCORD_USER_ID}>"
+        payload["allowed_mentions"] = {"users": [DISCORD_USER_ID]}
     try:
-        requests.post(DISCORD_URL,
-            json={"embeds": [{"title": title[:256], "description": body[:4096], "color": color}]},
-            timeout=10)
+        requests.post(DISCORD_URL, json=payload, timeout=10)
         time.sleep(0.5)
     except Exception as e:
         log(f"Discord error: {e}")
@@ -346,7 +352,7 @@ def discord_signal(
         f"{reason_line}"
         + kelly_line
     )
-    discord_send(f"{emoji} {ticker}  |  {status}", body, color)
+    discord_send(f"{emoji} {ticker}  |  {status}", body, color, mention=bool(traded or queued))
 
 def discord_exit(ticker, ret_pct, reason, hold_days, entry_px, exit_px, score, kelly):
     emoji = "✅" if ret_pct > 0 else "❌"
@@ -364,7 +370,8 @@ def discord_exit(ticker, ret_pct, reason, hold_days, entry_px, exit_px, score, k
     ]
     discord_send(f"{emoji} EXIT  {ticker}  {ret_pct:+.1f}%",
         "\n".join(lines),
-        0x2ECC71 if ret_pct > 0 else 0xE74C3C)
+        0x2ECC71 if ret_pct > 0 else 0xE74C3C,
+        mention=True)
 
 # ── ALPACA ────────────────────────────────────────────────────────────────────
 

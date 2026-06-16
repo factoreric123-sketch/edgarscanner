@@ -69,6 +69,7 @@ jobs:
           ALPACA_KEY:    ${{ secrets.ALPACA_KEY }}
           ALPACA_SECRET: ${{ secrets.ALPACA_SECRET }}
           DISCORD_URL:   ${{ secrets.DISCORD_URL }}
+          DISCORD_USER_ID: ${{ secrets.DISCORD_USER_ID }}
           SEC_USER_AGENT: ${{ secrets.SEC_USER_AGENT }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
