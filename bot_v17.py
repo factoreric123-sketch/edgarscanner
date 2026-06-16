@@ -38,7 +38,6 @@ ALPACA_KEY    = _os.getenv("ALPACA_KEY")
 ALPACA_SECRET = _os.getenv("ALPACA_SECRET")
 ALPACA_BASE   = "https://paper-api.alpaca.markets"
 DISCORD_URL   = _os.getenv("DISCORD_URL")
-DISCORD_USER_ID = _os.getenv("DISCORD_USER_ID")  # numeric Discord user ID; pinged on queued/traded/exits so the @mentions-only channel notifies
 SEC_USER_AGENT = _os.getenv("SEC_USER_AGENT") or "InsiderEdge/1.0 (contact: support@example.com)"
 SUPABASE_URL  = (_os.getenv("SUPABASE_URL") or "").rstrip("/")
 SUPABASE_SERVICE_ROLE_KEY = _os.getenv("SUPABASE_SERVICE_ROLE_KEY")
@@ -201,12 +200,11 @@ def discord_send(title, body, color=0x5865F2, mention=False):
         log("Discord webhook not configured; skipping Discord notification")
         return
     payload = {"embeds": [{"title": title[:256], "description": body[:4096], "color": color}]}
-    if mention and DISCORD_USER_ID:
-        # Embeds don't ping; the user-id mention lives in the message content,
-        # and allowed_mentions whitelists just this user so we never accidentally
-        # @here / @everyone the channel.
-        payload["content"] = f"<@{DISCORD_USER_ID}>"
-        payload["allowed_mentions"] = {"users": [DISCORD_USER_ID]}
+    if mention:
+        # Embeds don't ping; @everyone lives in the message content and
+        # allowed_mentions must explicitly opt in for the webhook to fire it.
+        payload["content"] = "@everyone"
+        payload["allowed_mentions"] = {"parse": ["everyone"]}
     try:
         requests.post(DISCORD_URL, json=payload, timeout=10)
         time.sleep(0.5)
