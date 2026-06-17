@@ -175,9 +175,20 @@ def _normalize_owner_name(name):
         cleaned = cleaned.replace(ch, " ")
     return " ".join(cleaned.split())
 
+# Word-level tokens: if the normalized filer name contains any of these as a
+# standalone word, treat as institutional. Catches Mudrick Capital Management,
+# Generic Asset Management, ABC Investment Corp, etc. without enumerating each.
+INSTITUTIONAL_BUYER_TOKENS = frozenset({
+    "INVESTMENT", "INVESTMENTS",
+    "CAPITAL",
+    "ASSET", "ASSETS",
+})
+
 def is_institutional_buyer(name):
     normalized = _normalize_owner_name(name)
-    return any(keyword in normalized for keyword in INSTITUTIONAL_BUYER_KEYWORDS)
+    if any(keyword in normalized for keyword in INSTITUTIONAL_BUYER_KEYWORDS):
+        return True
+    return bool(INSTITUTIONAL_BUYER_TOKENS.intersection(normalized.split()))
 
 # ── STATE ─────────────────────────────────────────────────────────────────────
 
