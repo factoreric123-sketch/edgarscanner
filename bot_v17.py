@@ -195,14 +195,18 @@ def save_state(state):
 
 # ── DISCORD ───────────────────────────────────────────────────────────────────
 
-def discord_send(title, body, color=0x5865F2):
+def discord_send(title, body, color=0x5865F2, mention=False):
     if not DISCORD_URL:
         log("Discord webhook not configured; skipping Discord notification")
         return
+    payload = {"embeds": [{"title": title[:256], "description": body[:4096], "color": color}]}
+    if mention:
+        # Embeds don't ping; @everyone lives in the message content and
+        # allowed_mentions must explicitly opt in for the webhook to fire it.
+        payload["content"] = "@everyone"
+        payload["allowed_mentions"] = {"parse": ["everyone"]}
     try:
-        requests.post(DISCORD_URL,
-            json={"embeds": [{"title": title[:256], "description": body[:4096], "color": color}]},
-            timeout=10)
+        requests.post(DISCORD_URL, json=payload, timeout=10)
         time.sleep(0.5)
     except Exception as e:
         log(f"Discord error: {e}")
@@ -346,7 +350,7 @@ def discord_signal(
         f"{reason_line}"
         + kelly_line
     )
-    discord_send(f"{emoji} {ticker}  |  {status}", body, color)
+    discord_send(f"{emoji} {ticker}  |  {status}", body, color, mention=bool(traded or queued))
 
 def discord_exit(ticker, ret_pct, reason, hold_days, entry_px, exit_px, score, kelly):
     emoji = "✅" if ret_pct > 0 else "❌"
@@ -364,7 +368,8 @@ def discord_exit(ticker, ret_pct, reason, hold_days, entry_px, exit_px, score, k
     ]
     discord_send(f"{emoji} EXIT  {ticker}  {ret_pct:+.1f}%",
         "\n".join(lines),
-        0x2ECC71 if ret_pct > 0 else 0xE74C3C)
+        0x2ECC71 if ret_pct > 0 else 0xE74C3C,
+        mention=True)
 
 # ── ALPACA ────────────────────────────────────────────────────────────────────
 
