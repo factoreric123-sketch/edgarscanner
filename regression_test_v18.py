@@ -45,11 +45,9 @@ r = filters(score=s, r3m=-0.421, spy_r3m=0.099, atr_pct=5.70, value=776_000,
 check(f"EYE queues (score={s:.0f})", r is None and bot.kelly_size(s, False, 1) > 0, f"reason={r}")
 
 print("\nMUST BLOCK — live losses & traps:")
-check("CHTR: earnings in 1d", filters(days_to_earnings=1) == "earnings_proximity")
 check("GMEX: HRT Financial", filters(insider_name="HRT FINANCIAL LP") == "institutional_buyer")
 check("Placement: 250x vol", filters(value=5_000_000, avg_vol_30d=20_000) == "private_placement")
 check("Solo 10b5-1", filters(is_10b5=True) == "10b5_plan")
-check("cs=6 cluster", filters(cluster=True, cluster_size=6) == "cluster_too_large")
 check("Solo score 50 (review tier ≠ queue)", filters(score=50) == "score_too_low")
 check("52w -96%", filters(h52=-96) == "52w_too_far")
 check("ATR 0.5%", filters(atr_pct=0.5) == "atr_too_low")

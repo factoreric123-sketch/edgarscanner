@@ -47,18 +47,15 @@ EODHD_KEY     = _os.getenv("EODHD_KEY")   # earnings calendar (free tier) — ma
 
 MAX_HOLD_DAYS             = 15
 SOLO_MIN_SCORE            = 56
-CLUSTER_MIN_SCORE         = 36
+CLUSTER_MIN_SCORE         = 48
 R3M_SKIP_ZONE_LO          = -0.30
-R3M_SKIP_ZONE_HI          = -0.20
+R3M_SKIP_ZONE_HI          = -0.25
 SCORE_90_100_MAX_R3M      = 0.0
 HEALTHCARE_MIN_CLUSTER    = 3
 HEALTHCARE_SECTORS        = {"Healthcare","Biotechnology","Biopharmaceuticals","Pharmaceuticals"}
-SPY_WEAK_REGIME_THRESHOLD = -0.05
 HEALTH_FILTER_BYPASS_SCORE= 70
-MAX_CLUSTER_SIZE          = 5
 MAX_INSIDER_BUYS_90D      = 3
 ATR_MIN_PCT               = 1.0
-EARNINGS_PROXIMITY_DAYS   = 5
 STALE_CLUSTER_DAYS        = 45     # v18 P2: clusters >45d after earnings = 33.3% WR
 MAX_QUEUE_AGE_DAYS        = 4      # v18 P4: drop queued signals older than 4 calendar days
 CLUSTER_LOOKBACK_DAYS     = 7      # v18 P7: Supabase cluster accumulation window
@@ -293,17 +290,15 @@ def discord_signal(
         "52w_too_far":            f"💀 **Near zero** — 52w high Δ {h52_s} <= -95% (distressed/delisted risk)",
         "institutional_buyer":    f"🏦 **Institutional/HFT filer** — {insider_name or 'This filer'} is not treated as a conviction insider buy",
         "entity_10pct_owner":     "🏦 **10% owner entity** — filer is neither officer nor director (treated as fund, not insider)",
-        "earnings_proximity":     f"📅 **Earnings too close** — filing within ±5 days of earnings (noise, not conviction)",
         "stale_cluster":          f"🕸️ **Stale cluster** — last earnings >{STALE_CLUSTER_DAYS}d ago (mid-quarter dead zone, WR=33.3% / -2.85% in dataset)",
         "private_placement":       "🏦 **Private placement** — value > 60× daily vol (not open market buy)",
         "10b5_plan":              "📋 **10b5-1 plan** — pre-scheduled, zero informational content",
-        "cluster_too_large":      f"👥 **Cluster too large** — cs={cluster_size} > 5 (board grant pattern, WR=45.5%)",
+        "cluster_too_large":      f"👥 **Large cluster** — cs={cluster_size} > 5 (flag only, not blocked — n=5 insufficient for hard rule)",
         "routine_buyer":          "🔄 **Routine buyer** — same insider >3x in 90 days on this ticker",
         "score_too_low":          f"📊 **Score too low** — {score:.0f} < floor {SOLO_MIN_SCORE if not cluster else CLUSTER_MIN_SCORE}",
         "score_too_low_stress":   f"📊 **Score too low (stress regime)** — {score:.0f} < stress floor 56 (SPY r3m {spy_s})",
         "r3m_dead_zone":          f"⚠️ **Dead zone** — r3m {r3m_s} between -30% and -20% (52% WR historically)",
         "score_90_100_hot":       f"🔥 **Score 90-100 + trending** — r3m {r3m_s} ≥ 0 (ownership stacking trap)",
-        "solo_weak_market":       f"📉 **Weak market** — solo signal + SPY r3m {spy_s} < -5%",
         "fmp_unavailable":        "⚙️ **FMP unavailable** — whitelist financialmodelingprep.com on PythonAnywhere",
     }
     if traded:
@@ -1233,8 +1228,6 @@ def apply_filters(ticker, title, is_10b5, cluster, cluster_size, score,
     # whales without board seats.
     if is_ten_percent_owner and not is_officer and not is_director:
         return "entity_10pct_owner"
-    if days_to_earnings is not None and abs(days_to_earnings) <= EARNINGS_PROXIMITY_DAYS:
-        return "earnings_proximity"
     # v18 P2: stale cluster — formed in the mid-quarter info dead zone (last earnings
     # >45d ago, no imminent catalyst). 33.3% WR / -2.85% in dataset. Solos exempt.
     if cluster and days_to_earnings is not None and days_to_earnings < -STALE_CLUSTER_DAYS:
@@ -1247,8 +1240,6 @@ def apply_filters(ticker, title, is_10b5, cluster, cluster_size, score,
         return "private_placement"
     if is_10b5 and not cluster:
         return "10b5_plan"
-    if cluster and cluster_size > MAX_CLUSTER_SIZE:
-        return "cluster_too_large"
     if routine:
         return "routine_buyer"
     _spy = spy_r3m if spy_r3m is not None else 0
@@ -1263,8 +1254,6 @@ def apply_filters(ticker, title, is_10b5, cluster, cluster_size, score,
     # v18 P5: was `90 <= score < 100` — score==100 was escaping the hot-stock trap.
     if score >= 90 and r3m is not None and r3m >= SCORE_90_100_MAX_R3M:
         return "score_90_100_hot"
-    if not cluster and spy_r3m is not None and spy_r3m < SPY_WEAK_REGIME_THRESHOLD:
-        return "solo_weak_market"
     return None
 
 # ── ROUTINE BUYER ─────────────────────────────────────────────────────────────
@@ -1371,8 +1360,7 @@ def enter_position(state, ticker, score, score_comp, cluster, cluster_size,
     # a discount, down on a chase. Boost stays within remaining exposure.
     if insider_px and price:
         drift = (price - insider_px) / insider_px
-        if   drift <= -0.01: k = min(k * 1.15, remaining)
-        elif drift >=  0.01: k = k * 0.85
+        if drift <= -0.01: k = min(k * 1.15, remaining)
         log(f"  {ticker}: drift {drift*100:+.1f}% vs insider ${insider_px:.2f} → kelly {k:.0%}")
 
     notional = equity * k
