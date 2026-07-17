@@ -51,6 +51,11 @@ check("Solo 10b5-1", filters(is_10b5=True) == "10b5_plan")
 check("Solo score 50 (review tier ≠ queue)", filters(score=50) == "score_too_low")
 check("52w -96%", filters(h52=-96) == "52w_too_far")
 check("ATR 0.5%", filters(atr_pct=0.5) == "atr_too_low")
+check("Sub-$1 price floor", filters(price=0.85) == "price_too_low")
+check("$1+ price OK", filters(price=1.50) is None)
+check("Entity 10% owner (no title)",
+      filters(title="", is_ten_percent_owner=True, is_officer=False,
+              is_director=False) == "entity_10pct_owner")
 
 print("\nV18 PATCHES — fail here = patch not applied:")
 r = filters(cluster=True, cluster_size=3, score=75, days_to_earnings=-60)
@@ -63,6 +68,15 @@ s,c = bot.score_signal(500_000, 8.0, -50, -0.45, 0.05, True, 3, 0.05)
 check("P1 pre5 still works for clusters", c.get("pts_pre5", 0) == 5, f"pts_pre5={c.get('pts_pre5')}")
 check("P5 score=100 hot trap", filters(score=100, r3m=0.10) == "score_90_100_hot",
       f"got={filters(score=100, r3m=0.10)}")
+# P19: SEC Form 4 relationship flags come as "true"/"false" OR "1"/"0".
+import xml.etree.ElementTree as _ET
+_owner = _ET.fromstring("<reportingOwner><reportingOwnerRelationship>"
+    "<isDirector>false</isDirector><isOfficer>false</isOfficer>"
+    "<isTenPercentOwner>true</isTenPercentOwner></reportingOwnerRelationship></reportingOwner>")
+check("P19 xml_flag parses 'true'", bot._xml_flag(_owner, ".//isTenPercentOwner") is True,
+      f"got={bot._xml_flag(_owner, './/isTenPercentOwner')}")
+check("P19 xml_flag parses 'false'", bot._xml_flag(_owner, ".//isDirector") is False,
+      f"got={bot._xml_flag(_owner, './/isDirector')}")
 
 print(f"\n{'='*40}\n{P} passed, {F} failed — "
       + ("✅ SAFE TO DEPLOY" if F == 0 else "🛑 DO NOT DEPLOY"))

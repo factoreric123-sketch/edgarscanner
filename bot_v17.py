@@ -56,6 +56,7 @@ HEALTHCARE_SECTORS        = {"Healthcare","Biotechnology","Biopharmaceuticals","
 HEALTH_FILTER_BYPASS_SCORE= 70
 MAX_INSIDER_BUYS_90D      = 3
 ATR_MIN_PCT               = 1.0
+MIN_PRICE                 = 1.00   # v18 P18: reinstated $1 floor — sub-$1 = 6/6 live losses (Stage-3 vetoes)
 STALE_CLUSTER_DAYS        = 45     # v18 P2: clusters >45d after earnings = 33.3% WR
 MAX_QUEUE_AGE_DAYS        = 4      # v18 P4: drop queued signals older than 4 calendar days
 CLUSTER_LOOKBACK_DAYS     = 7      # v18 P7: Supabase cluster accumulation window
@@ -290,6 +291,7 @@ def discord_signal(
         "52w_too_far":            f"💀 **Near zero** — 52w high Δ {h52_s} <= -95% (distressed/delisted risk)",
         "institutional_buyer":    f"🏦 **Institutional/HFT filer** — {insider_name or 'This filer'} is not treated as a conviction insider buy",
         "entity_10pct_owner":     "🏦 **10% owner entity** — filer is neither officer nor director (treated as fund, not insider)",
+        "price_too_low":          f"🪙 **Price too low** — ${current_price or 0:.2f} < ${MIN_PRICE:.2f} floor (penny/reverse-split treadmill, 6/6 live losses)",
         "stale_cluster":          f"🕸️ **Stale cluster** — last earnings >{STALE_CLUSTER_DAYS}d ago (mid-quarter dead zone, WR=33.3% / -2.85% in dataset)",
         "private_placement":       "🏦 **Private placement** — value > 60× daily vol (not open market buy)",
         "10b5_plan":              "📋 **10b5-1 plan** — pre-scheduled, zero informational content",
@@ -827,6 +829,10 @@ def _xml_text(node, path, default=""):
         return default
     return found.text.strip()
 
+def _xml_flag(node, path):
+    # SEC Form 4 encodes relationship booleans as either "1"/"0" or "true"/"false".
+    return _xml_text(node, path).strip().lower() in ("1", "true")
+
 def _clean_accession(filename):
     tail = filename.rsplit("/", 1)[-1]
     acc = tail[:-4] if tail.lower().endswith(".txt") else tail
@@ -926,9 +932,9 @@ def parse_filing_transactions(filing):
     owner = root.find(".//reportingOwner")
     owner_name = _xml_text(owner, ".//rptOwnerName") if owner is not None else ""
     title = _xml_text(owner, ".//officerTitle") if owner is not None else ""
-    is_director = _xml_text(owner, ".//isDirector") == "1" if owner is not None else False
-    is_officer = _xml_text(owner, ".//isOfficer") == "1" if owner is not None else False
-    is_ten_percent_owner = _xml_text(owner, ".//isTenPercentOwner") == "1" if owner is not None else False
+    is_director = _xml_flag(owner, ".//isDirector") if owner is not None else False
+    is_officer = _xml_flag(owner, ".//isOfficer") if owner is not None else False
+    is_ten_percent_owner = _xml_flag(owner, ".//isTenPercentOwner") if owner is not None else False
     if not title:
         title = "Director" if is_director else ("Officer" if is_officer else "")
     issuer_name = _xml_text(root, ".//issuerName")
@@ -1214,9 +1220,12 @@ def kelly_size(score, cluster, cluster_size):
 def apply_filters(ticker, title, is_10b5, cluster, cluster_size, score,
                   r3m, spy_r3m, routine, atr_pct, avg_vol_30d=None, value=0,
                   h52=None, days_to_earnings=None, insider_name=None,
-                  is_ten_percent_owner=False, is_officer=False, is_director=False):
+                  is_ten_percent_owner=False, is_officer=False, is_director=False,
+                  price=None):
     if ticker in TICKER_BLACKLIST:
         return "ticker_blacklisted"
+    if price is not None and price < MIN_PRICE:
+        return "price_too_low"
     if h52 is not None and h52 <= -95:
         return "52w_too_far"
     if insider_name and is_institutional_buyer(insider_name):
@@ -1534,7 +1543,8 @@ def scan_filings(state):
                                days_to_earnings=days_to_earnings, insider_name=name,
                                is_ten_percent_owner=rep.get("is_ten_percent_owner", False),
                                is_officer=rep.get("is_officer", False),
-                               is_director=rep.get("is_director", False))
+                               is_director=rep.get("is_director", False),
+                               price=cur_px)
 
         cl_str  = f"CLUSTER cs={cluster_size}" if cluster else "solo"
         r3m_str = f"{r3m*100:+.0f}%" if r3m is not None else "N/A"
